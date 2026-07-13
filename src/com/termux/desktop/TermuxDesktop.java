@@ -43,6 +43,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
 
     static final String DEFAULT_FONT_PATH = System.getProperty("user.home") + "/.local/share/fonts/oplus/OplusOSUI-Regular.ttf";
     static final int DEFAULT_FONT_SIZE = 20;
+    private static final boolean STATS_ENABLED = "1".equals(System.getenv("TERMUX_DESKTOP_STATS"));
 
     private final long startupNanos;
     private boolean startupReported;
@@ -52,7 +53,13 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     private final Font baseFont;
     private JFrame frame;
     private final Timer synchronizedOutputTimer;
+    private final Timer frameTimer;
+    private final Timer statsTimer;
     private boolean synchronizedOutputRepaintPending;
+    private boolean framePending;
+    private long paintsSinceStats;
+    private long statsSampleNanos;
+    private boolean renderFailureReported;
     private int scrollOffset;
     private int mouseButtonDown = -1;
     private boolean selectionMouseDown;
@@ -79,7 +86,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         SwingUtilities.invokeLater(() -> {
             try {
                 openWindow(font, size, startupNanos);
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 e.printStackTrace();
                 System.exit(1);
             }
@@ -100,96 +107,147 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         setFocusTraversalKeysEnabled(false);
         setBackground(Color.BLACK);
         synchronizedOutputTimer = new Timer(150, e -> {
-            if (synchronizedOutputRepaintPending) {
-                synchronizedOutputRepaintPending = false;
-                repaint();
+            try {
+                if (synchronizedOutputRepaintPending) {
+                    synchronizedOutputRepaintPending = false;
+                    requestFrameRepaint();
+                }
+            } catch (Throwable t) {
+                reportWindowFailure("synchronized-output timer", t);
             }
         });
         synchronizedOutputTimer.setRepeats(false);
+        frameTimer = new Timer(16, e -> {
+            try {
+                if (framePending) {
+                    framePending = false;
+                    repaint();
+                } else {
+                    ((Timer) e.getSource()).stop();
+                }
+            } catch (Throwable t) {
+                ((Timer) e.getSource()).stop();
+                reportWindowFailure("frame timer", t);
+            }
+        });
+        frameTimer.setRepeats(true);
+        statsTimer = new Timer(1000, e -> {
+            try {
+                printStats();
+            } catch (Throwable t) {
+                reportWindowFailure("stats timer", t);
+            }
+        });
+        statsTimer.setRepeats(true);
 
         addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent e) {
-                if (e.isControlDown() && e.isShiftDown() && e.getKeyCode() == KeyEvent.VK_C) {
-                    if (hasSelection()) copySelection(emulator());
-                    e.consume();
-                    return;
+                try {
+                    if (e.isControlDown() && e.isShiftDown() && e.getKeyCode() == KeyEvent.VK_C) {
+                        if (hasSelection()) copySelection(emulator());
+                        e.consume();
+                        return;
+                    }
+                    clearSelection();
+                    handleKey(e);
+                } catch (Throwable t) {
+                    reportWindowFailure("key pressed", t);
                 }
-                clearSelection();
-                handleKey(e);
             }
 
             @Override
             public void keyTyped(KeyEvent e) {
-                char c = e.getKeyChar();
-                if (c == KeyEvent.CHAR_UNDEFINED || e.isControlDown() || e.isAltDown()) return;
-                if (c == '\n' || c == '\b' || c == '\t' || c == 27 || c == 127) return; // handled in keyPressed
-                session.writeString(String.valueOf(c));
+                try {
+                    char c = e.getKeyChar();
+                    if (c == KeyEvent.CHAR_UNDEFINED || e.isControlDown() || e.isAltDown()) return;
+                    if (c == '\n' || c == '\b' || c == '\t' || c == 27 || c == 127) return; // handled in keyPressed
+                    if (session != null) session.writeString(String.valueOf(c));
+                } catch (Throwable t) {
+                    reportWindowFailure("key typed", t);
+                }
             }
         });
 
         addComponentListener(new ComponentAdapter() {
             @Override
             public void componentResized(ComponentEvent e) {
-                resizeToComponent();
+                try {
+                    resizeToComponent();
+                } catch (Throwable t) {
+                    reportWindowFailure("resize handling", t);
+                }
             }
         });
 
         addMouseListener(new MouseAdapter() {
             @Override
             public void mousePressed(MouseEvent e) {
-                TerminalEmulator emulator = emulator();
-                int button = terminalMouseButton(e.getButton());
-                if (emulator == null || button < 0) return;
+                try {
+                    TerminalEmulator emulator = emulator();
+                    int button = terminalMouseButton(e.getButton());
+                    if (emulator == null || button < 0) return;
 
-                boolean mouseTracking = emulator.isMouseTrackingActive();
-                if (e.getButton() == MouseEvent.BUTTON1 && (!mouseTracking || e.isShiftDown())) {
-                    beginSelection(e, emulator);
-                } else if (e.getButton() == MouseEvent.BUTTON2 && (!mouseTracking || e.isShiftDown())) {
-                    clearSelection();
-                    pasteFromClipboards(session, true);
-                } else if (mouseTracking) {
-                    clearSelection();
-                    mouseButtonDown = button;
-                    emulator.sendMouseEvent(button, mouseColumn(e), mouseRow(e), true);
+                    boolean mouseTracking = emulator.isMouseTrackingActive();
+                    if (e.getButton() == MouseEvent.BUTTON1 && (!mouseTracking || e.isShiftDown())) {
+                        beginSelection(e, emulator);
+                    } else if (e.getButton() == MouseEvent.BUTTON2 && (!mouseTracking || e.isShiftDown())) {
+                        clearSelection();
+                        pasteFromClipboards(session, true);
+                    } else if (mouseTracking) {
+                        clearSelection();
+                        mouseButtonDown = button;
+                        emulator.sendMouseEvent(button, mouseColumn(e), mouseRow(e), true);
+                    }
+                } catch (Throwable t) {
+                    reportWindowFailure("mouse press", t);
                 }
             }
 
             @Override
             public void mouseReleased(MouseEvent e) {
-                TerminalEmulator emulator = emulator();
-                if (selectionMouseDown) {
-                    // A double/triple click already installed its complete word/line
-                    // rectangle. Preserve it unless the pointer was actually dragged.
-                    if (!selectionStartedByMultiClick || selectionDragged) updateSelection(e, emulator);
-                    if (selectionDragged || selectionStartedByMultiClick) {
-                        copySelection(emulator);
-                    } else {
-                        clearSelection();
+                try {
+                    TerminalEmulator emulator = emulator();
+                    if (selectionMouseDown) {
+                        // A double/triple click already installed its complete word/line
+                        // rectangle. Preserve it unless the pointer was actually dragged.
+                        if (!selectionStartedByMultiClick || selectionDragged) updateSelection(e, emulator);
+                        if (selectionDragged || selectionStartedByMultiClick) {
+                            copySelection(emulator);
+                        } else {
+                            clearSelection();
+                        }
+                        selectionMouseDown = false;
+                        selectionDragged = false;
+                        selectionStartedByMultiClick = false;
+                    } else if (emulator != null && mouseButtonDown >= 0 && emulator.isMouseTrackingActive()) {
+                        emulator.sendMouseEvent(mouseButtonDown, mouseColumn(e), mouseRow(e), false);
                     }
-                    selectionMouseDown = false;
-                    selectionDragged = false;
-                    selectionStartedByMultiClick = false;
-                } else if (emulator != null && mouseButtonDown >= 0 && emulator.isMouseTrackingActive()) {
-                    emulator.sendMouseEvent(mouseButtonDown, mouseColumn(e), mouseRow(e), false);
+                    mouseButtonDown = -1;
+                } catch (Throwable t) {
+                    mouseButtonDown = -1;
+                    reportWindowFailure("mouse release", t);
                 }
-                mouseButtonDown = -1;
             }
         });
 
         addMouseMotionListener(new MouseAdapter() {
             @Override
             public void mouseDragged(MouseEvent e) {
-                TerminalEmulator emulator = emulator();
-                if (selectionMouseDown) {
-                    updateSelection(e, emulator);
-                    return;
+                try {
+                    TerminalEmulator emulator = emulator();
+                    if (selectionMouseDown) {
+                        updateSelection(e, emulator);
+                        return;
+                    }
+                    if (emulator == null || !emulator.isMouseTrackingActive() || mouseButtonDown < 0) return;
+                    // Bit 5 is the xterm motion flag; the vendored emulator accepts
+                    // it for all three buttons, while 32 remains its left-motion constant.
+                    emulator.sendMouseEvent(mouseButtonDown | TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED,
+                        mouseColumn(e), mouseRow(e), true);
+                } catch (Throwable t) {
+                    reportWindowFailure("mouse drag", t);
                 }
-                if (emulator == null || !emulator.isMouseTrackingActive() || mouseButtonDown < 0) return;
-                // Bit 5 is the xterm motion flag; the vendored emulator accepts
-                // it for all three buttons, while 32 remains its left-motion constant.
-                emulator.sendMouseEvent(mouseButtonDown | TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED,
-                    mouseColumn(e), mouseRow(e), true);
             }
         });
 
@@ -271,6 +329,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     }
 
     private void finishSession() {
+        stopRenderingTimers();
         if (session != null) session.finish();
     }
 
@@ -281,6 +340,10 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         try {
             newSession.initializeEmulator(cols(), rows(), (int) renderer.getFontWidth(), renderer.getFontLineSpacing(),
                 new String[]{shell, "-l"});
+            if (STATS_ENABLED) {
+                statsSampleNanos = System.nanoTime();
+                statsTimer.start();
+            }
         } catch (Exception e) {
             newSession.finish();
             throw e;
@@ -293,7 +356,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     private void resizeToComponent() {
         if (session != null && session.mEmulator != null) {
             session.updateSize(cols(), rows(), (int) renderer.getFontWidth(), renderer.getFontLineSpacing());
-            repaint();
+            requestFrameRepaint();
         }
     }
 
@@ -349,7 +412,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         } else {
             setSelection(selectionAnchorX, selectionAnchorY, selectionAnchorX, selectionAnchorY);
         }
-        repaint();
+        requestFrameRepaint();
     }
 
     private void updateSelection(MouseEvent e, TerminalEmulator emulator) {
@@ -358,7 +421,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         int y = selectionRow(e, emulator);
         if (x != selectionAnchorX || y != selectionAnchorY) selectionDragged = true;
         setSelection(selectionAnchorX, selectionAnchorY, x, y);
-        repaint();
+        requestFrameRepaint();
     }
 
     /** Set inclusive endpoints in the same coordinate system as TerminalBuffer and TerminalRenderer. */
@@ -431,7 +494,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         selectionMouseDown = false;
         selectionDragged = false;
         selectionStartedByMultiClick = false;
-        repaint();
+        requestFrameRepaint();
     }
 
     private void copySelection(TerminalEmulator emulator) {
@@ -502,6 +565,14 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     }
 
     private void handleMouseWheel(MouseWheelEvent e) {
+        try {
+            handleMouseWheelInternal(e);
+        } catch (Throwable t) {
+            reportWindowFailure("mouse wheel", t);
+        }
+    }
+
+    private void handleMouseWheelInternal(MouseWheelEvent e) {
         TerminalEmulator emulator = emulator();
         if (emulator == null || e.getWheelRotation() == 0) return;
 
@@ -525,7 +596,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         int oldOffset = scrollOffset;
         int maximumOffset = emulator.getScreen().getActiveTranscriptRows();
         scrollOffset = Math.max(0, Math.min(maximumOffset, scrollOffset - rotation));
-        if (scrollOffset != oldOffset) repaint();
+        if (scrollOffset != oldOffset) requestFrameRepaint();
     }
 
     private void armSynchronizedOutputRepaint() {
@@ -533,11 +604,61 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         synchronizedOutputTimer.restart();
     }
 
+    /**
+     * Coalesce all output-induced repaint requests to a 16 ms frame clock.
+     * Swing's repaint manager may merge more aggressively, but this component
+     * never asks it to damage the surface more often than this clock allows.
+     */
     private void requestRepaint(TerminalSession s) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            try {
+                SwingUtilities.invokeLater(() -> {
+                    try {
+                        requestRepaint(s);
+                    } catch (Throwable t) {
+                        reportWindowFailure("deferred terminal repaint", t);
+                    }
+                });
+            } catch (Throwable t) {
+                reportWindowFailure("terminal repaint scheduling", t);
+            }
+            return;
+        }
+        if (s != null && s != session) return;
         if (s != null && s.mEmulator != null && s.mEmulator.isSynchronizedOutput()) {
+            framePending = false;
+            frameTimer.stop();
             armSynchronizedOutputRepaint();
-        } else {
+            return;
+        }
+
+        synchronizedOutputRepaintPending = false;
+        synchronizedOutputTimer.stop();
+        requestFrameRepaint();
+    }
+
+    private void requestFrameRepaint() {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            try {
+                SwingUtilities.invokeLater(() -> {
+                    try {
+                        requestFrameRepaint();
+                    } catch (Throwable t) {
+                        reportWindowFailure("deferred repaint", t);
+                    }
+                });
+            } catch (Throwable t) {
+                reportWindowFailure("repaint scheduling", t);
+            }
+            return;
+        }
+
+        if (!frameTimer.isRunning()) {
+            framePending = false;
             repaint();
+            frameTimer.start();
+        } else {
+            framePending = true;
         }
     }
 
@@ -629,40 +750,113 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
 
     @Override
     protected void paintComponent(Graphics g) {
-        if (!startupReported && startupNanos != 0) {
-            startupReported = true;
-            System.err.println("startup-ms: " + ((System.nanoTime() - startupNanos) / 1_000_000L));
+        paintsSinceStats++;
+        try {
+            if (!startupReported && startupNanos != 0) {
+                startupReported = true;
+                System.err.println("startup-ms: " + ((System.nanoTime() - startupNanos) / 1_000_000L));
+            }
+            super.paintComponent(g);
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                g2.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_ON);
+                TerminalSession currentSession = session;
+                TerminalEmulator emulator = currentSession == null ? null : currentSession.mEmulator;
+                if (emulator == null) return;
+                g2.setColor(new Color(emulator.mColors.mCurrentColors[com.termux.terminal.TextStyle.COLOR_INDEX_BACKGROUND], true));
+                g2.fillRect(0, 0, getWidth(), getHeight());
+                int maximumOffset = emulator.isAlternateBufferActive() ? 0 : emulator.getScreen().getActiveTranscriptRows();
+                int topRow = emulator.isAlternateBufferActive() ? 0 : -Math.min(scrollOffset, maximumOffset);
+                renderer.render(emulator, g2, topRow, selectionY1, selectionY2, selectionX1, selectionX2);
+            } finally {
+                g2.dispose();
+            }
+        } catch (Throwable t) {
+            if (!renderFailureReported) {
+                renderFailureReported = true;
+                reportWindowFailure("paint", t);
+            }
+            // Leave a visible, recoverable frame behind instead of allowing a
+            // renderer exception to escape through the EDT's event pump.
+            try {
+                g.setColor(Color.BLACK);
+                g.fillRect(0, 0, getWidth(), getHeight());
+                g.setColor(Color.RED);
+                g.drawString("terminal render error", 8, 18);
+            } catch (Throwable ignored) {
+            }
         }
-        Graphics2D g2 = (Graphics2D) g;
-        g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
-        g2.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_ON);
-        if (session == null || session.mEmulator == null) return;
-        g2.setColor(new Color(session.mEmulator.mColors.mCurrentColors[com.termux.terminal.TextStyle.COLOR_INDEX_BACKGROUND], true));
-        g2.fillRect(0, 0, getWidth(), getHeight());
-        int maximumOffset = session.mEmulator.isAlternateBufferActive() ? 0 : session.mEmulator.getScreen().getActiveTranscriptRows();
-        int topRow = session.mEmulator.isAlternateBufferActive() ? 0 : -Math.min(scrollOffset, maximumOffset);
-        renderer.render(session.mEmulator, g2, topRow, selectionY1, selectionY2, selectionX1, selectionX2);
+    }
+
+    private void printStats() {
+        if (!STATS_ENABLED) return;
+        long now = System.nanoTime();
+        long elapsed = Math.max(1L, now - statsSampleNanos);
+        long bytes = session == null ? 0 : session.consumeAppendedBytes();
+        long paints = paintsSinceStats;
+        paintsSinceStats = 0;
+        statsSampleNanos = now;
+        long bytesPerSecond = (long) (bytes * 1_000_000_000.0 / elapsed);
+        long paintsPerSecond = (long) (paints * 1_000_000_000.0 / elapsed);
+        System.err.println("termux-desktop-stats window="
+            + Integer.toHexString(System.identityHashCode(this))
+            + " bytes/sec=" + bytesPerSecond + " paints/sec=" + paintsPerSecond);
+    }
+
+    private void stopRenderingTimers() {
+        synchronizedOutputTimer.stop();
+        frameTimer.stop();
+        statsTimer.stop();
+        synchronizedOutputRepaintPending = false;
+        framePending = false;
+    }
+
+    private void reportWindowFailure(String operation, Throwable t) {
+        System.err.println("termux-desktop window " + operation + " failed: " + t);
+        t.printStackTrace(System.err);
     }
 
     // -- TerminalSessionClient --
 
     @Override public void onTextChanged(TerminalSession s) {
-        if (s.mEmulator != null && s.mEmulator.isAlternateBufferActive()) scrollOffset = 0;
-        if (s.mEmulator != null && s.mEmulator.isSynchronizedOutput()) {
-            armSynchronizedOutputRepaint();
+        if (!SwingUtilities.isEventDispatchThread()) {
+            try {
+                SwingUtilities.invokeLater(() -> {
+                    try {
+                        onTextChanged(s);
+                    } catch (Throwable t) {
+                        reportWindowFailure("deferred text change", t);
+                    }
+                });
+            } catch (Throwable t) {
+                reportWindowFailure("text-change scheduling", t);
+            }
             return;
         }
-        synchronizedOutputRepaintPending = false;
-        synchronizedOutputTimer.stop();
-        repaint();
+        if (s == null || s != session) return;
+        if (s.mEmulator != null && s.mEmulator.isAlternateBufferActive()) scrollOffset = 0;
+        requestRepaint(s);
     }
     @Override public void onTitleChanged(TerminalSession s) {
-        JFrame f = (JFrame) SwingUtilities.getWindowAncestor(this);
-        if (f != null && s.mEmulator != null) f.setTitle(String.valueOf(s.mEmulator.getTitle()));
+        try {
+            if (s != session) return;
+            JFrame f = (JFrame) SwingUtilities.getWindowAncestor(this);
+            if (f != null && s.mEmulator != null) f.setTitle(String.valueOf(s.mEmulator.getTitle()));
+        } catch (Throwable t) {
+            reportWindowFailure("title handling", t);
+        }
     }
     @Override public void onSessionFinished(TerminalSession s) {
-        if (s != null) s.finish();
-        if (frame != null) frame.dispose();
+        try {
+            if (s != null) s.finish();
+            if (s == session) {
+                stopRenderingTimers();
+                if (frame != null) frame.dispose();
+            }
+        } catch (Throwable t) {
+            reportWindowFailure("session finish", t);
+        }
     }
     @Override public void onCopyTextToClipboard(TerminalSession s, String text) {
         writeTextToClipboard(text);
@@ -671,7 +865,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         pasteFromClipboards(s, false);
     }
 
-    private static void pasteFromClipboards(TerminalSession s, boolean primaryFirst) {
+    private void pasteFromClipboards(TerminalSession s, boolean primaryFirst) {
         if (s == null) return;
         CLIPBOARD_IO.execute(() -> {
             String text = null;
@@ -695,7 +889,15 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
             if (text != null) {
                 final String pasteText = text;
                 SwingUtilities.invokeLater(() -> {
-                    if (s.mEmulator != null) s.mEmulator.paste(pasteText);
+                    try {
+                        if (s.mEmulator != null) {
+                            s.mEmulator.paste(pasteText);
+                            if (s == session) requestRepaint(s);
+                        }
+                    } catch (Throwable t) {
+                        System.err.println("termux-desktop paste failed: " + t);
+                        t.printStackTrace(System.err);
+                    }
                 });
             }
         });
@@ -710,7 +912,13 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
             return null;
         }
     }
-    @Override public void onBell(TerminalSession s) { Toolkit.getDefaultToolkit().beep(); }
+    @Override public void onBell(TerminalSession s) {
+        try {
+            if (s == session) Toolkit.getDefaultToolkit().beep();
+        } catch (Throwable t) {
+            reportWindowFailure("bell", t);
+        }
+    }
     @Override public void onColorsChanged(TerminalSession s) { requestRepaint(s); }
     @Override public void onTerminalCursorStateChange(boolean state) { requestRepaint(session); }
     @Override public void setTerminalShellPid(TerminalSession s, int pid) { }

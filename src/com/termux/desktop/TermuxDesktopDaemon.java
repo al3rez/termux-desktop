@@ -24,8 +24,23 @@ public final class TermuxDesktopDaemon {
 
     private final Map<String, Font> fonts = new HashMap<>();
 
-    public static void main(String[] args) throws Exception {
-        new TermuxDesktopDaemon().run();
+    public static void main(String[] args) {
+        installSupervisionHandler();
+        try {
+            new TermuxDesktopDaemon().run();
+        } catch (Throwable t) {
+            logFailure("daemon", t);
+        }
+    }
+
+    private static void installSupervisionHandler() {
+        Thread.setDefaultUncaughtExceptionHandler((thread, failure) ->
+            logFailure("uncaught thread " + thread.getName(), failure));
+    }
+
+    private static void logFailure(String operation, Throwable failure) {
+        System.err.println("termux-desktop " + operation + " failed: " + failure);
+        failure.printStackTrace(System.err);
     }
 
     private void run() throws Exception {
@@ -55,9 +70,15 @@ public final class TermuxDesktopDaemon {
         try (server) {
             while (true) {
                 try (SocketChannel client = server.accept()) {
-                    handle(client);
-                } catch (Exception e) {
-                    e.printStackTrace(System.err);
+                    try {
+                        handle(client);
+                    } catch (Throwable t) {
+                        // A request is a supervision boundary.  A bad client
+                        // must not unwind the accept loop or close other windows.
+                        logFailure("socket request", t);
+                    }
+                } catch (Throwable t) {
+                    logFailure("socket accept", t);
                 }
             }
         }
@@ -101,37 +122,56 @@ public final class TermuxDesktopDaemon {
         }
     }
 
-    private void handle(SocketChannel client) throws Exception {
-        BufferedReader reader = new BufferedReader(new InputStreamReader(
-            Channels.newInputStream(client), StandardCharsets.UTF_8));
-        BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
-            Channels.newOutputStream(client), StandardCharsets.UTF_8));
+    private void handle(SocketChannel client) {
+        final BufferedReader reader;
+        final BufferedWriter writer;
+        try {
+            reader = new BufferedReader(new InputStreamReader(
+                Channels.newInputStream(client), StandardCharsets.UTF_8));
+            writer = new BufferedWriter(new OutputStreamWriter(
+                Channels.newOutputStream(client), StandardCharsets.UTF_8));
+        } catch (Throwable t) {
+            logFailure("socket setup", t);
+            return;
+        }
 
-        String request = reader.readLine();
+        String request;
+        try {
+            request = reader.readLine();
+        } catch (Throwable t) {
+            logFailure("socket read", t);
+            return;
+        }
+
         long requestNanos = System.nanoTime();
         String response;
         try {
             OpenRequest open = parse(request);
             Font font = font(open.fontPath, open.size);
-            AtomicReference<Exception> error = new AtomicReference<>();
+            AtomicReference<Throwable> error = new AtomicReference<>();
             SwingUtilities.invokeAndWait(() -> {
                 try {
                     TermuxDesktop.openWindow(font, open.size);
-                } catch (Exception e) {
-                    error.set(e);
+                } catch (Throwable t) {
+                    error.set(t);
                 }
             });
-            if (error.get() != null) throw error.get();
+            if (error.get() != null) throw new RequestFailure(error.get());
             long openMs = (System.nanoTime() - requestNanos) / 1_000_000L;
             response = "ok " + openMs;
             System.err.println("window-open-ms: " + openMs);
-        } catch (Exception e) {
-            response = "error " + singleLine(e.getMessage());
+        } catch (Throwable t) {
+            logFailure("request", t);
+            response = "error " + singleLine(t);
         }
 
-        writer.write(response);
-        writer.newLine();
-        writer.flush();
+        try {
+            writer.write(response);
+            writer.newLine();
+            writer.flush();
+        } catch (Throwable t) {
+            logFailure("socket response", t);
+        }
     }
 
     private Font font(String path, int size) throws Exception {
@@ -168,6 +208,18 @@ public final class TermuxDesktopDaemon {
     private static String singleLine(String message) {
         if (message == null || message.isEmpty()) return "request failed";
         return message.replace('\n', ' ').replace('\r', ' ');
+    }
+
+    private static String singleLine(Throwable failure) {
+        if (failure instanceof RequestFailure && failure.getCause() != null)
+            return singleLine(failure.getCause().getMessage());
+        return singleLine(failure == null ? null : failure.getMessage());
+    }
+
+    private static final class RequestFailure extends RuntimeException {
+        RequestFailure(Throwable cause) {
+            super(cause);
+        }
     }
 
     private static final class OpenRequest {

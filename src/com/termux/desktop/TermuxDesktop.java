@@ -35,6 +35,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /** Swing shell around Termux's TerminalEmulator + the Java2D port of its renderer. */
 public final class TermuxDesktop extends JComponent implements TerminalSessionClient {
@@ -62,6 +64,11 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     private int selectionY1 = -1;
     private int selectionX2 = -1;
     private int selectionY2 = -1;
+    private static final ExecutorService CLIPBOARD_IO = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "clipboard-io");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     public static void main(String[] args) throws Exception {
         long startupNanos = System.nanoTime();
@@ -103,6 +110,11 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent e) {
+                if (e.isControlDown() && e.isShiftDown() && e.getKeyCode() == KeyEvent.VK_C) {
+                    if (hasSelection()) copySelection(emulator());
+                    e.consume();
+                    return;
+                }
                 clearSelection();
                 handleKey(e);
             }
@@ -263,10 +275,16 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     }
 
     void startShell() throws Exception {
-        session = new TerminalSession(this);
+        TerminalSession newSession = new TerminalSession(this);
+        session = newSession;
         String shell = System.getenv().getOrDefault("SHELL", "/bin/bash");
-        session.initializeEmulator(cols(), rows(), (int) renderer.getFontWidth(), renderer.getFontLineSpacing(),
-            new String[]{shell, "-l"});
+        try {
+            newSession.initializeEmulator(cols(), rows(), (int) renderer.getFontWidth(), renderer.getFontLineSpacing(),
+                new String[]{shell, "-l"});
+        } catch (Exception e) {
+            newSession.finish();
+            throw e;
+        }
     }
 
     private int cols() { return Math.max(4, (int) (getWidth() / renderer.getFontWidth())); }
@@ -430,20 +448,48 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     }
 
     private static void writeTextToClipboards(String text) {
-        Thread clipboardWriter = new Thread(() -> {
-            Toolkit toolkit = Toolkit.getDefaultToolkit();
+        queueClipboardWrite(text, true);
+    }
+
+    private static void writeTextToClipboard(String text) {
+        queueClipboardWrite(text, false);
+    }
+
+    private static void queueClipboardWrite(String text, boolean includePrimary) {
+        if (text == null) return;
+        CLIPBOARD_IO.execute(() -> {
+            final Toolkit toolkit;
             try {
-                toolkit.getSystemClipboard().setContents(new StringSelection(text), null);
-            } catch (Exception ignored) {
+                toolkit = Toolkit.getDefaultToolkit();
+            } catch (Exception e) {
+                reportClipboardFailure("initialize", e);
+                return;
             }
+
             try {
-                Clipboard primary = toolkit.getSystemSelection();
-                if (primary != null) primary.setContents(new StringSelection(text), null);
-            } catch (Exception ignored) {
+                setClipboardText(toolkit.getSystemClipboard(), text);
+            } catch (Exception e) {
+                reportClipboardFailure("system clipboard write", e);
             }
-        }, "clipboard-writer");
-        clipboardWriter.setDaemon(true);
-        clipboardWriter.start();
+            if (includePrimary) {
+                try {
+                    Clipboard primary = toolkit.getSystemSelection();
+                    if (primary != null) setClipboardText(primary, text);
+                } catch (Exception e) {
+                    reportClipboardFailure("PRIMARY write", e);
+                }
+            }
+        });
+    }
+
+    private static void setClipboardText(Clipboard clipboard, String text) {
+        if (clipboard == null) return;
+        StringSelection selection = new StringSelection(text);
+        clipboard.setContents(selection, selection);
+    }
+
+    private static void reportClipboardFailure(String operation, Exception e) {
+        System.err.println("clipboard " + operation + " failed: " + e);
     }
 
     private static int terminalMouseButton(int awtButton) {
@@ -615,36 +661,44 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         if (f != null && s.mEmulator != null) f.setTitle(String.valueOf(s.mEmulator.getTitle()));
     }
     @Override public void onSessionFinished(TerminalSession s) {
+        if (s != null) s.finish();
         if (frame != null) frame.dispose();
     }
     @Override public void onCopyTextToClipboard(TerminalSession s, String text) {
-        Thread clipboardWriter = new Thread(() -> {
-            try {
-                Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
-            } catch (Exception ignored) {
-            }
-        }, "clipboard-writer");
-        clipboardWriter.setDaemon(true);
-        clipboardWriter.start();
+        writeTextToClipboard(text);
     }
     @Override public void onPasteTextFromClipboard(TerminalSession s) {
         pasteFromClipboards(s, false);
     }
 
     private static void pasteFromClipboards(TerminalSession s, boolean primaryFirst) {
-        Thread clipboardReader = new Thread(() -> {
+        if (s == null) return;
+        CLIPBOARD_IO.execute(() -> {
+            String text = null;
             try {
                 Toolkit toolkit = Toolkit.getDefaultToolkit();
-                Clipboard primary = toolkit.getSystemSelection();
-                Clipboard clipboard = toolkit.getSystemClipboard();
-                String text = primaryFirst ? readClipboardText(primary) : readClipboardText(clipboard);
+                Clipboard primary = null;
+                Clipboard clipboard = null;
+                try {
+                    primary = toolkit.getSystemSelection();
+                } catch (Exception ignored) {
+                }
+                try {
+                    clipboard = toolkit.getSystemClipboard();
+                } catch (Exception ignored) {
+                }
+                text = primaryFirst ? readClipboardText(primary) : readClipboardText(clipboard);
                 if (text == null) text = primaryFirst ? readClipboardText(clipboard) : readClipboardText(primary);
-                if (text != null && s.mEmulator != null) s.mEmulator.paste(text);
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                reportClipboardFailure("read", e);
             }
-        }, "clipboard-reader");
-        clipboardReader.setDaemon(true);
-        clipboardReader.start();
+            if (text != null) {
+                final String pasteText = text;
+                SwingUtilities.invokeLater(() -> {
+                    if (s.mEmulator != null) s.mEmulator.paste(pasteText);
+                });
+            }
+        });
     }
 
     private static String readClipboardText(Clipboard clipboard) {

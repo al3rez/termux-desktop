@@ -22,12 +22,13 @@ public final class TerminalSession extends TerminalOutput {
     private final TerminalSessionClient mClient;
     private PtyProcess mProcess;
     private OutputStream mPtyIn;
+    private volatile boolean mFinished;
 
     public TerminalSession(TerminalSessionClient client) {
         mClient = client;
     }
 
-    public void initializeEmulator(int columns, int rows, int cellW, int cellH, String[] command) throws IOException {
+    public synchronized void initializeEmulator(int columns, int rows, int cellW, int cellH, String[] command) throws IOException {
         mEmulator = new TerminalEmulator(this, columns, rows, cellW, cellH, 2000, mClient);
 
         Map<String, String> env = new HashMap<>(System.getenv());
@@ -50,6 +51,7 @@ public final class TerminalSession extends TerminalOutput {
                     final int len = n;
                     try {
                         javax.swing.SwingUtilities.invokeAndWait(() -> {
+                            if (mFinished) return;
                             mEmulator.append(chunk, len);
                             try {
                                 mClient.onTextChanged(this);
@@ -69,15 +71,17 @@ public final class TerminalSession extends TerminalOutput {
         reader.start();
     }
 
-    public void updateSize(int columns, int rows, int cellW, int cellH) {
-        if (mEmulator == null) return;
+    public synchronized void updateSize(int columns, int rows, int cellW, int cellH) {
+        if (mEmulator == null || mFinished) return;
         mEmulator.resize(columns, rows, cellW, cellH);
         int widthPixels = columns * cellW;
         int heightPixels = rows * cellH;
-        if (mProcess != null) mProcess.setWinSize(new WinSize(columns, rows, widthPixels, heightPixels));
+        if (mProcess != null && !mFinished) mProcess.setWinSize(new WinSize(columns, rows, widthPixels, heightPixels));
     }
 
-    public void finish() {
+    public synchronized void finish() {
+        if (mFinished) return;
+        mFinished = true;
         if (mProcess != null) mProcess.destroy();
         if (mPtyIn != null) {
             try {
@@ -87,12 +91,13 @@ public final class TerminalSession extends TerminalOutput {
         }
     }
 
-    public boolean isRunning() {
+    public synchronized boolean isRunning() {
         return mProcess != null && mProcess.isAlive();
     }
 
     @Override
-    public void write(byte[] data, int offset, int count) {
+    public synchronized void write(byte[] data, int offset, int count) {
+        if (mFinished) return;
         try {
             if (mPtyIn != null) {
                 mPtyIn.write(data, offset, count);

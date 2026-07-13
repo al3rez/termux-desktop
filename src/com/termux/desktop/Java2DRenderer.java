@@ -251,9 +251,6 @@ public final class Java2DRenderer {
         if (codePoint >= 0x2580 && codePoint <= 0x259F) return true;
         if (codePoint >= 0x256D && codePoint <= 0x257F) return true;
         if (codePoint >= 0x2500 && codePoint <= 0x254B) return true;
-        // Powerline separators: font glyphs rarely match the exact cell height,
-        // leaving gaps between prompt segments; draw them as cell geometry.
-        if (codePoint >= 0xE0B0 && codePoint <= 0xE0B7) return true;
         return false;
     }
 
@@ -302,70 +299,15 @@ public final class Java2DRenderer {
         // Pixel-aligned filled shapes keep neighboring cells joined even when
         // the text antialiasing hint is enabled for the rest of the terminal.
         Graphics2D geometryCanvas = (Graphics2D) canvas.create();
-        // Diagonals and arcs need antialiasing; axis-aligned box/block fills
-        // must stay aliased so neighboring cells join without seams.
         geometryCanvas.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
-            codePoint >= 0xE0B0 ? java.awt.RenderingHints.VALUE_ANTIALIAS_ON
-                                : java.awt.RenderingHints.VALUE_ANTIALIAS_OFF);
+            java.awt.RenderingHints.VALUE_ANTIALIAS_OFF);
         geometryCanvas.setColor(new Color(foreColor, true));
-        if (codePoint >= 0xE0B0) {
-            drawPowerlineElement(geometryCanvas, x, y, width, height, codePoint);
-        } else if (codePoint >= 0x2580) {
+        if (codePoint >= 0x2580) {
             drawBlockElement(geometryCanvas, x, y, width, height, codePoint, foreColor);
         } else {
             drawBoxElement(geometryCanvas, x, y, width, height, codePoint, bold);
         }
         geometryCanvas.dispose();
-    }
-
-    /** Powerline separators U+E0B0-E0B7: triangles, chevrons and semicircles spanning the exact cell. */
-    private void drawPowerlineElement(Graphics2D g, float x, float y, float w, float h, int codePoint) {
-        float midY = y + h / 2f;
-        java.awt.BasicStroke stroke = new java.awt.BasicStroke(Math.max(1f, mTextSize / 12f));
-        switch (codePoint) {
-            case 0xE0B0: { // solid right triangle
-                java.awt.geom.Path2D.Float p = new java.awt.geom.Path2D.Float();
-                p.moveTo(x, y); p.lineTo(x + w, midY); p.lineTo(x, y + h); p.closePath();
-                g.fill(p);
-                break;
-            }
-            case 0xE0B1: { // right chevron
-                g.setStroke(stroke);
-                java.awt.geom.Path2D.Float p = new java.awt.geom.Path2D.Float();
-                p.moveTo(x, y); p.lineTo(x + w, midY); p.lineTo(x, y + h);
-                g.draw(p);
-                break;
-            }
-            case 0xE0B2: { // solid left triangle
-                java.awt.geom.Path2D.Float p = new java.awt.geom.Path2D.Float();
-                p.moveTo(x + w, y); p.lineTo(x, midY); p.lineTo(x + w, y + h); p.closePath();
-                g.fill(p);
-                break;
-            }
-            case 0xE0B3: { // left chevron
-                g.setStroke(stroke);
-                java.awt.geom.Path2D.Float p = new java.awt.geom.Path2D.Float();
-                p.moveTo(x + w, y); p.lineTo(x, midY); p.lineTo(x + w, y + h);
-                g.draw(p);
-                break;
-            }
-            case 0xE0B4: // solid right semicircle
-                g.fill(new java.awt.geom.Arc2D.Float(x - w, y, 2 * w, h, -90, 180, java.awt.geom.Arc2D.PIE));
-                break;
-            case 0xE0B5: { // right semicircle outline
-                g.setStroke(stroke);
-                g.draw(new java.awt.geom.Arc2D.Float(x - w, y, 2 * w, h, -90, 180, java.awt.geom.Arc2D.OPEN));
-                break;
-            }
-            case 0xE0B6: // solid left semicircle
-                g.fill(new java.awt.geom.Arc2D.Float(x, y, 2 * w, h, 90, 180, java.awt.geom.Arc2D.PIE));
-                break;
-            case 0xE0B7: { // left semicircle outline
-                g.setStroke(stroke);
-                g.draw(new java.awt.geom.Arc2D.Float(x, y, 2 * w, h, 90, 180, java.awt.geom.Arc2D.OPEN));
-                break;
-            }
-        }
     }
 
     private static int dimColor(int color) {

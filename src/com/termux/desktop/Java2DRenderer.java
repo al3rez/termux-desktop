@@ -180,7 +180,11 @@ public final class Java2DRenderer {
                     }
                     int cursorColor = insideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
                     boolean invertCursorTextColor = insideCursor && cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK;
-                    drawGeometricCell(canvas, palette, column * mFontWidth, (row - topRow) * mFontLineSpacing,
+                    // Text runs draw shifted down by mFontLineSpacingAndAscent (the
+                    // heightOffset loop starts there, matching Android). Geometry
+                    // must use the same origin or it sits above the text backgrounds.
+                    drawGeometricCell(canvas, palette, column * mFontWidth,
+                        (row - topRow) * mFontLineSpacing + mFontLineSpacingAndAscent,
                         codePointWcWidth * mFontWidth, mFontLineSpacing, codePoint, style, cursorColor, cursorShape,
                         reverseVideo || invertCursorTextColor || insideSelection);
 
@@ -251,6 +255,11 @@ public final class Java2DRenderer {
         if (codePoint >= 0x2580 && codePoint <= 0x259F) return true;
         if (codePoint >= 0x256D && codePoint <= 0x257F) return true;
         if (codePoint >= 0x2500 && codePoint <= 0x254B) return true;
+        // Solid powerline triangles only: their font glyphs sit ~1px short of
+        // the cell top, leaving a background sliver between prompt segments.
+        // Chevrons/semicircles (E0B1, E0B3-E0B7) stay on the font path — they
+        // don't need seamless joins and the font's shapes look better.
+        if (codePoint == 0xE0B0 || codePoint == 0xE0B2) return true;
         return false;
     }
 
@@ -299,10 +308,22 @@ public final class Java2DRenderer {
         // Pixel-aligned filled shapes keep neighboring cells joined even when
         // the text antialiasing hint is enabled for the rest of the terminal.
         Graphics2D geometryCanvas = (Graphics2D) canvas.create();
+        // Triangles need antialiased diagonals; axis-aligned box/block fills
+        // must stay aliased so neighboring cells join without seams.
         geometryCanvas.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
-            java.awt.RenderingHints.VALUE_ANTIALIAS_OFF);
+            (codePoint == 0xE0B0 || codePoint == 0xE0B2) ? java.awt.RenderingHints.VALUE_ANTIALIAS_ON
+                                                         : java.awt.RenderingHints.VALUE_ANTIALIAS_OFF);
         geometryCanvas.setColor(new Color(foreColor, true));
-        if (codePoint >= 0x2580) {
+        if (codePoint == 0xE0B0 || codePoint == 0xE0B2) {
+            java.awt.geom.Path2D.Float p = new java.awt.geom.Path2D.Float();
+            if (codePoint == 0xE0B0) { // solid right-pointing triangle
+                p.moveTo(x, y); p.lineTo(x + width, y + height / 2f); p.lineTo(x, y + height);
+            } else { // solid left-pointing triangle
+                p.moveTo(x + width, y); p.lineTo(x, y + height / 2f); p.lineTo(x + width, y + height);
+            }
+            p.closePath();
+            geometryCanvas.fill(p);
+        } else if (codePoint >= 0x2580) {
             drawBlockElement(geometryCanvas, x, y, width, height, codePoint, foreColor);
         } else {
             drawBoxElement(geometryCanvas, x, y, width, height, codePoint, bold);

@@ -12,17 +12,20 @@ public class RenderChecks {
         BufferedImage icons = ImageIO.read(new File(args[1]));
         int cw = Integer.parseInt(args[2]), ch = Integer.parseInt(args[3]);
 
-        // Powerline: " A " red segment, then E0B0 in column 3 drawn red-on-blue.
-        // The separator cell's left edge must be red at top AND bottom (full height).
-        int x = 3 * cw + 1;
-        // Sample at quarter heights where the triangle has real width (its top
-        // and bottom corners are 1px slivers that antialiasing blends away).
-        int upper = pl.getRGB(x, ch / 4);
-        int lower = pl.getRGB(x, ch - 1 - ch / 4);
-        assertTrue(red(upper) > 100 && red(upper) > 2 * blue(upper), "E0B0 upper-left should be red, got " + hex(upper));
-        assertTrue(red(lower) > 100 && red(lower) > 2 * blue(lower), "E0B0 lower-left should be red, got " + hex(lower));
-        // Apex reaches the right side of the cell at mid height.
-        int apex = pl.getRGB(3 * cw + cw - 2, ch / 2);
+        // Powerline: " A " red-bg segment, then E0B0 drawn red-on-blue. The
+        // triangle's left-edge inked extent must match the segment background's
+        // vertical extent (offset-agnostic: both are located by scanning).
+        int segX = 1 * cw + 1, sepX = 3 * cw;  // sepX: triangle base column, its only full-height extent
+        int segTop = -1, segBot = -1, triTop = -1, triBot = -1;
+        for (int y = 0; y < pl.getHeight(); y++) {
+            if (red(pl.getRGB(segX, y)) > 120 && blue(pl.getRGB(segX, y)) < 100) { if (segTop < 0) segTop = y; segBot = y; }
+            if (red(pl.getRGB(sepX, y)) > 120 && blue(pl.getRGB(sepX, y)) < 100) { if (triTop < 0) triTop = y; triBot = y; }
+        }
+        assertTrue(segTop >= 0, "segment background not found");
+        assertTrue(triTop >= 0, "E0B0 separator rendered nothing");
+        assertTrue(Math.abs(segTop - triTop) <= 1 && Math.abs(segBot - triBot) <= 1,
+            "E0B0 misaligned with segment bg: seg " + segTop + ".." + segBot + " vs tri " + triTop + ".." + triBot);
+        int apex = pl.getRGB(3 * cw + cw - 2, (triTop + triBot) / 2);
         assertTrue(red(apex) > 100, "E0B0 apex should reach cell right edge, got " + hex(apex));
 
         // Icon aspect: branch icon (E0A0) in cell 0. Find inked horizontal extent.

@@ -27,11 +27,5 @@ python3 -c "import sys; sys.stdout.write('\uE0A0 branch')" \
 
 CELL=$(java -cp "out:lib/*:$TMP" RenderHarness "$TMP/cell.png" "$DEJAVU" 20 </dev/null | sed 's/.*cell=//')
 CW=${CELL%x*}; CH=${CELL#*x}
-# The powerline check currently documents a KNOWN GAP: font glyphs do not
-# span the exact cell (the vector-drawing attempt was reverted pending a fix
-# validated against a real prompt). Warn instead of fail until reinstated.
-if java -cp "out:lib/*:$TMP" RenderChecks "$TMP/pl.png" "$TMP/icons.png" "$CW" "$CH"; then
-  echo "ALL RENDER TESTS PASSED"
-else
-  echo "WARN: powerline cell-height check failing (known issue, vectors reverted)"
-fi
+java -cp "out:lib/*:$TMP" RenderChecks "$TMP/pl.png" "$TMP/icons.png" "$CW" "$CH"
+echo "ALL RENDER TESTS PASSED"

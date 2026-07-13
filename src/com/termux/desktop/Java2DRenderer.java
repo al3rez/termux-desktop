@@ -650,4 +650,8 @@ public final class Java2DRenderer {
     public int getFontLineSpacing() {
         return mFontLineSpacing;
     }
+
+    public int getFontLineSpacingAndAscent() {
+        return mFontLineSpacingAndAscent;
+    }
 }

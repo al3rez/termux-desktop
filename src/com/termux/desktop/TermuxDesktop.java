@@ -14,8 +14,10 @@ import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.Image;
 import java.awt.RenderingHints;
 import java.awt.Toolkit;
+import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.ComponentAdapter;
@@ -27,8 +29,12 @@ import java.awt.event.MouseEvent;
 import java.awt.event.MouseWheelEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.awt.image.BufferedImage;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 /** Swing shell around Termux's TerminalEmulator + the Java2D port of its renderer. */
 public final class TermuxDesktop extends JComponent implements TerminalSessionClient {
@@ -47,6 +53,15 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     private boolean synchronizedOutputRepaintPending;
     private int scrollOffset;
     private int mouseButtonDown = -1;
+    private boolean selectionMouseDown;
+    private boolean selectionDragged;
+    private boolean selectionStartedByMultiClick;
+    private int selectionAnchorX = -1;
+    private int selectionAnchorY = -1;
+    private int selectionX1 = -1;
+    private int selectionY1 = -1;
+    private int selectionX2 = -1;
+    private int selectionY2 = -1;
 
     public static void main(String[] args) throws Exception {
         long startupNanos = System.nanoTime();
@@ -88,6 +103,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         addKeyListener(new KeyAdapter() {
             @Override
             public void keyPressed(KeyEvent e) {
+                clearSelection();
                 handleKey(e);
             }
 
@@ -113,20 +129,38 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
                 TerminalEmulator emulator = emulator();
                 int button = terminalMouseButton(e.getButton());
                 if (emulator == null || button < 0) return;
-                if (emulator.isMouseTrackingActive()) {
+
+                boolean mouseTracking = emulator.isMouseTrackingActive();
+                if (e.getButton() == MouseEvent.BUTTON1 && (!mouseTracking || e.isShiftDown())) {
+                    beginSelection(e, emulator);
+                } else if (e.getButton() == MouseEvent.BUTTON2 && (!mouseTracking || e.isShiftDown())) {
+                    clearSelection();
+                    pasteFromClipboards(session, true);
+                } else if (mouseTracking) {
+                    clearSelection();
                     mouseButtonDown = button;
                     emulator.sendMouseEvent(button, mouseColumn(e), mouseRow(e), true);
-                } else if (e.getButton() == MouseEvent.BUTTON2) {
-                    onPasteTextFromClipboard(session);
                 }
             }
 
             @Override
             public void mouseReleased(MouseEvent e) {
                 TerminalEmulator emulator = emulator();
-                int button = mouseButtonDown >= 0 ? mouseButtonDown : terminalMouseButton(e.getButton());
-                if (emulator != null && emulator.isMouseTrackingActive() && button >= 0)
-                    emulator.sendMouseEvent(button, mouseColumn(e), mouseRow(e), false);
+                if (selectionMouseDown) {
+                    // A double/triple click already installed its complete word/line
+                    // rectangle. Preserve it unless the pointer was actually dragged.
+                    if (!selectionStartedByMultiClick || selectionDragged) updateSelection(e, emulator);
+                    if (selectionDragged || selectionStartedByMultiClick) {
+                        copySelection(emulator);
+                    } else {
+                        clearSelection();
+                    }
+                    selectionMouseDown = false;
+                    selectionDragged = false;
+                    selectionStartedByMultiClick = false;
+                } else if (emulator != null && mouseButtonDown >= 0 && emulator.isMouseTrackingActive()) {
+                    emulator.sendMouseEvent(mouseButtonDown, mouseColumn(e), mouseRow(e), false);
+                }
                 mouseButtonDown = -1;
             }
         });
@@ -135,6 +169,10 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
             @Override
             public void mouseDragged(MouseEvent e) {
                 TerminalEmulator emulator = emulator();
+                if (selectionMouseDown) {
+                    updateSelection(e, emulator);
+                    return;
+                }
                 if (emulator == null || !emulator.isMouseTrackingActive() || mouseButtonDown < 0) return;
                 // Bit 5 is the xterm motion flag; the vendored emulator accepts
                 // it for all three buttons, while 32 remains its left-motion constant.
@@ -164,8 +202,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
 
         TermuxDesktop term = new TermuxDesktop(font, size, startupNanos);
         JFrame frame = new JFrame("termux-desktop");
-        java.awt.Image icon = loadAppIcon();
-        if (icon != null) frame.setIconImage(icon);
+        List<Image> icons = loadAppIcons();
         term.frame = frame;
         frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         frame.addWindowListener(new WindowAdapter() {
@@ -176,13 +213,18 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         });
         frame.add(term);
         frame.pack();
+        // The X11 peer is created by pack(). Applying the icon now, and again
+        // after mapping, makes the _NET_WM_ICON update reliable under XWayland.
+        if (!icons.isEmpty()) frame.setIconImages(icons);
         term.startShell();
         frame.setVisible(true);
+        if (!icons.isEmpty()) frame.setIconImages(icons);
         term.requestFocusInWindow();
         return frame;
     }
 
     private static java.awt.Image appIcon;
+    private static List<Image> appIcons;
 
     /** The Termux launcher icon: from the classpath (jarred out/ dir), or the installed hicolor copy. */
     private static java.awt.Image loadAppIcon() {
@@ -195,6 +237,25 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         } catch (Exception ignored) {
         }
         return null;
+    }
+
+    /** Supply the X11 peer with several concrete sizes instead of one scaled source image. */
+    private static List<Image> loadAppIcons() {
+        if (appIcons != null) return appIcons;
+        Image source = loadAppIcon();
+        if (source == null) return Collections.emptyList();
+
+        List<Image> icons = new ArrayList<>();
+        for (int size : new int[]{16, 32, 48, 64, 96, 128, 192}) {
+            BufferedImage scaled = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D graphics = scaled.createGraphics();
+            graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            graphics.drawImage(source, 0, 0, size, size, null);
+            graphics.dispose();
+            icons.add(scaled);
+        }
+        return appIcons = Collections.unmodifiableList(icons);
     }
 
     private void finishSession() {
@@ -233,7 +294,156 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     }
 
     private int mouseRow(MouseEvent e) {
-        return e.getY() / renderer.getFontLineSpacing() + 1;
+        return (int) Math.floor((e.getY() - renderer.getFontLineSpacingAndAscent()) / (double) renderer.getFontLineSpacing()) + 1;
+    }
+
+    private int selectionColumn(MouseEvent e, TerminalEmulator emulator) {
+        int column = (int) Math.floor(e.getX() / (double) renderer.getFontWidth());
+        return Math.max(0, Math.min(emulator.mColumns - 1, column));
+    }
+
+    private int selectionRow(MouseEvent e, TerminalEmulator emulator) {
+        int row = (int) Math.floor((e.getY() - renderer.getFontLineSpacingAndAscent())
+            / (double) renderer.getFontLineSpacing()) + terminalTopRow(emulator);
+        int minimum = -emulator.getScreen().getActiveTranscriptRows();
+        return Math.max(minimum, Math.min(emulator.mRows - 1, row));
+    }
+
+    private int terminalTopRow(TerminalEmulator emulator) {
+        return emulator.isAlternateBufferActive() ? 0
+            : -Math.min(scrollOffset, emulator.getScreen().getActiveTranscriptRows());
+    }
+
+    private void beginSelection(MouseEvent e, TerminalEmulator emulator) {
+        clearSelection();
+        selectionMouseDown = true;
+        selectionDragged = false;
+        selectionStartedByMultiClick = false;
+        selectionAnchorX = selectionColumn(e, emulator);
+        selectionAnchorY = selectionRow(e, emulator);
+
+        if (e.getClickCount() >= 3) {
+            selectLine(selectionAnchorY, emulator);
+            selectionStartedByMultiClick = hasSelection();
+        } else if (e.getClickCount() == 2) {
+            selectWord(selectionAnchorX, selectionAnchorY, emulator);
+            selectionStartedByMultiClick = hasSelection();
+        } else {
+            setSelection(selectionAnchorX, selectionAnchorY, selectionAnchorX, selectionAnchorY);
+        }
+        repaint();
+    }
+
+    private void updateSelection(MouseEvent e, TerminalEmulator emulator) {
+        if (!selectionMouseDown || emulator == null) return;
+        int x = selectionColumn(e, emulator);
+        int y = selectionRow(e, emulator);
+        if (x != selectionAnchorX || y != selectionAnchorY) selectionDragged = true;
+        setSelection(selectionAnchorX, selectionAnchorY, x, y);
+        repaint();
+    }
+
+    /** Set inclusive endpoints in the same coordinate system as TerminalBuffer and TerminalRenderer. */
+    private void setSelection(int x1, int y1, int x2, int y2) {
+        if (y1 < y2 || (y1 == y2 && x1 <= x2)) {
+            selectionX1 = x1;
+            selectionY1 = y1;
+            selectionX2 = x2;
+            selectionY2 = y2;
+        } else {
+            selectionX1 = x2;
+            selectionY1 = y2;
+            selectionX2 = x1;
+            selectionY2 = y1;
+        }
+    }
+
+    private void selectLine(int row, TerminalEmulator emulator) {
+        setSelection(0, row, emulator.mColumns - 1, row);
+    }
+
+    private void selectWord(int column, int row, TerminalEmulator emulator) {
+        String clicked = cellText(emulator, column, row);
+        if (clicked.isEmpty() || isWhitespace(clicked)) {
+            clearSelection();
+            return;
+        }
+
+        boolean clickedDelimiter = isWordDelimiter(clicked);
+        int left = column;
+        int right = column;
+        if (!clickedDelimiter) {
+            while (left > 0 && !isWordDelimiter(cellText(emulator, left - 1, row))) left--;
+            while (right < emulator.mColumns - 1 && !isWordDelimiter(cellText(emulator, right + 1, row))) right++;
+        }
+        setSelection(left, row, right, row);
+    }
+
+    private static String cellText(TerminalEmulator emulator, int column, int row) {
+        return emulator.getScreen().getSelectedText(column, row, column, row);
+    }
+
+    private static boolean isWhitespace(String text) {
+        return text.isEmpty() || Character.isWhitespace(text.codePointAt(0));
+    }
+
+    /** Word selection treats whitespace and punctuation as boundaries while retaining underscores in words. */
+    private static boolean isWordDelimiter(String text) {
+        if (text.isEmpty()) return true;
+        int codePoint = text.codePointAt(0);
+        if (Character.isWhitespace(codePoint)) return true;
+        if (Character.isLetterOrDigit(codePoint) || codePoint == '_') return false;
+        int type = Character.getType(codePoint);
+        return type == Character.CONNECTOR_PUNCTUATION || type == Character.DASH_PUNCTUATION
+            || type == Character.START_PUNCTUATION || type == Character.END_PUNCTUATION
+            || type == Character.INITIAL_QUOTE_PUNCTUATION || type == Character.FINAL_QUOTE_PUNCTUATION
+            || type == Character.OTHER_PUNCTUATION
+            || ",.;:!?()[]{}<>\"'`~!@#$%^&*+-=/\\|".indexOf(codePoint) >= 0;
+    }
+
+    private boolean hasSelection() {
+        return selectionX1 >= 0 && selectionY1 >= 0 - (emulator() == null ? 0 : emulator().getScreen().getActiveTranscriptRows())
+            && selectionX2 >= selectionX1 && selectionY2 >= selectionY1;
+    }
+
+    private void clearSelection() {
+        if (!hasSelection() && !selectionMouseDown) return;
+        selectionAnchorX = selectionAnchorY = -1;
+        selectionX1 = selectionY1 = selectionX2 = selectionY2 = -1;
+        selectionMouseDown = false;
+        selectionDragged = false;
+        selectionStartedByMultiClick = false;
+        repaint();
+    }
+
+    private void copySelection(TerminalEmulator emulator) {
+        if (emulator == null || !hasSelection()) {
+            clearSelection();
+            return;
+        }
+        String text = emulator.getScreen().getSelectedText(selectionX1, selectionY1, selectionX2, selectionY2);
+        if (text == null || text.isEmpty()) {
+            clearSelection();
+            return;
+        }
+        writeTextToClipboards(text);
+    }
+
+    private static void writeTextToClipboards(String text) {
+        Thread clipboardWriter = new Thread(() -> {
+            Toolkit toolkit = Toolkit.getDefaultToolkit();
+            try {
+                toolkit.getSystemClipboard().setContents(new StringSelection(text), null);
+            } catch (Exception ignored) {
+            }
+            try {
+                Clipboard primary = toolkit.getSystemSelection();
+                if (primary != null) primary.setContents(new StringSelection(text), null);
+            } catch (Exception ignored) {
+            }
+        }, "clipboard-writer");
+        clipboardWriter.setDaemon(true);
+        clipboardWriter.start();
     }
 
     private static int terminalMouseButton(int awtButton) {
@@ -385,7 +595,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         g2.fillRect(0, 0, getWidth(), getHeight());
         int maximumOffset = session.mEmulator.isAlternateBufferActive() ? 0 : session.mEmulator.getScreen().getActiveTranscriptRows();
         int topRow = session.mEmulator.isAlternateBufferActive() ? 0 : -Math.min(scrollOffset, maximumOffset);
-        renderer.render(session.mEmulator, g2, topRow, -1, -1, -1, -1);
+        renderer.render(session.mEmulator, g2, topRow, selectionY1, selectionY2, selectionX1, selectionX2);
     }
 
     // -- TerminalSessionClient --
@@ -418,15 +628,33 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         clipboardWriter.start();
     }
     @Override public void onPasteTextFromClipboard(TerminalSession s) {
+        pasteFromClipboards(s, false);
+    }
+
+    private static void pasteFromClipboards(TerminalSession s, boolean primaryFirst) {
         Thread clipboardReader = new Thread(() -> {
             try {
-                String text = (String) Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor);
+                Toolkit toolkit = Toolkit.getDefaultToolkit();
+                Clipboard primary = toolkit.getSystemSelection();
+                Clipboard clipboard = toolkit.getSystemClipboard();
+                String text = primaryFirst ? readClipboardText(primary) : readClipboardText(clipboard);
+                if (text == null) text = primaryFirst ? readClipboardText(clipboard) : readClipboardText(primary);
                 if (text != null && s.mEmulator != null) s.mEmulator.paste(text);
             } catch (Exception ignored) {
             }
         }, "clipboard-reader");
         clipboardReader.setDaemon(true);
         clipboardReader.start();
+    }
+
+    private static String readClipboardText(Clipboard clipboard) {
+        if (clipboard == null) return null;
+        try {
+            if (!clipboard.isDataFlavorAvailable(DataFlavor.stringFlavor)) return null;
+            return (String) clipboard.getData(DataFlavor.stringFlavor);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
     @Override public void onBell(TerminalSession s) { Toolkit.getDefaultToolkit().beep(); }
     @Override public void onColorsChanged(TerminalSession s) { requestRepaint(s); }

@@ -16,7 +16,7 @@ public final class KeyEvent {
     public static final int KEYCODE_PAGE_DOWN = 93;
     public static final int KEYCODE_ESCAPE = 111;
     public static final int KEYCODE_FORWARD_DEL = 112;
-    public static final int KEYCODE_HOME = 122;
+    public static final int KEYCODE_HOME = 3;
     public static final int KEYCODE_MOVE_HOME = 122;
     public static final int KEYCODE_MOVE_END = 123;
     public static final int KEYCODE_INSERT = 124;

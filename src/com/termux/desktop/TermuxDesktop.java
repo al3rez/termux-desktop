@@ -21,6 +21,8 @@ import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 
@@ -36,13 +38,22 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         String fontPath = args.length > 0 ? args[0] : System.getProperty("user.home") + "/.local/share/fonts/oplus/OplusOSUI-Regular.ttf";
         int size = args.length > 1 ? Integer.parseInt(args[1]) : 20;
 
-        Font font = Font.createFont(Font.TRUETYPE_FONT, new File(fontPath));
+        File fontFile = new File(fontPath);
+        Font font = fontFile.exists()
+            ? Font.createFont(Font.TRUETYPE_FONT, fontFile)
+            : new Font(Font.MONOSPACED, Font.PLAIN, size);
 
         SwingUtilities.invokeLater(() -> {
             try {
                 TermuxDesktop term = new TermuxDesktop(font, size);
                 JFrame frame = new JFrame("termux-desktop");
                 frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+                frame.addWindowListener(new WindowAdapter() {
+                    @Override
+                    public void windowClosing(WindowEvent e) {
+                        if (term.session != null) term.session.finish();
+                    }
+                });
                 frame.add(term);
                 frame.pack();
                 frame.setVisible(true);
@@ -118,6 +129,18 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         if (e.isControlDown() && e.isAltDown() && e.getKeyCode() == KeyEvent.VK_MINUS) { changeFontSize(-2); return; }
         if (e.isControlDown() && e.isShiftDown() && e.getKeyCode() == KeyEvent.VK_V) { onPasteTextFromClipboard(session); return; }
 
+        if (e.isAltDown() && !e.isControlDown()) {
+            char c = e.getKeyChar();
+            if (c != KeyEvent.CHAR_UNDEFINED && !Character.isISOControl(c)) {
+                byte[] charBytes = String.valueOf(c).getBytes(StandardCharsets.UTF_8);
+                byte[] altBytes = new byte[charBytes.length + 1];
+                altBytes[0] = 0x1b;
+                System.arraycopy(charBytes, 0, altBytes, 1, charBytes.length);
+                session.write(altBytes, 0, altBytes.length);
+                return;
+            }
+        }
+
         int androidKey = mapKey(e.getKeyCode());
         if (androidKey != -1) {
             int keyMode = 0;
@@ -138,6 +161,16 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
                 session.write(new byte[]{(byte) (c - KeyEvent.VK_A + 1)}, 0, 1);
             } else if (c == KeyEvent.VK_SPACE) {
                 session.write(new byte[]{0}, 0, 1);
+            } else if (c == KeyEvent.VK_OPEN_BRACKET || e.getKeyChar() == '[') {
+                session.write(new byte[]{0x1b}, 0, 1);
+            } else if (c == KeyEvent.VK_BACK_SLASH || e.getKeyChar() == '\\') {
+                session.write(new byte[]{0x1c}, 0, 1);
+            } else if (c == KeyEvent.VK_CLOSE_BRACKET || e.getKeyChar() == ']') {
+                session.write(new byte[]{0x1d}, 0, 1);
+            } else if (c == KeyEvent.VK_CIRCUMFLEX || e.getKeyChar() == '^') {
+                session.write(new byte[]{0x1e}, 0, 1);
+            } else if (c == KeyEvent.VK_UNDERSCORE || e.getKeyChar() == '_') {
+                session.write(new byte[]{0x1f}, 0, 1);
             }
         }
     }
@@ -194,15 +227,25 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     }
     @Override public void onSessionFinished(TerminalSession s) { System.exit(0); }
     @Override public void onCopyTextToClipboard(TerminalSession s, String text) {
-        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
+        Thread clipboardWriter = new Thread(() -> {
+            try {
+                Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
+            } catch (Exception ignored) {
+            }
+        }, "clipboard-writer");
+        clipboardWriter.setDaemon(true);
+        clipboardWriter.start();
     }
     @Override public void onPasteTextFromClipboard(TerminalSession s) {
-        try {
-            String text = (String) Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor);
-            if (text != null) session.getClass(); // guard
-            if (text != null) session.writeString(text);
-        } catch (Exception ignored) {
-        }
+        Thread clipboardReader = new Thread(() -> {
+            try {
+                String text = (String) Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor);
+                if (text != null && s.mEmulator != null) s.mEmulator.paste(text);
+            } catch (Exception ignored) {
+            }
+        }, "clipboard-reader");
+        clipboardReader.setDaemon(true);
+        clipboardReader.start();
     }
     @Override public void onBell(TerminalSession s) { Toolkit.getDefaultToolkit().beep(); }
     @Override public void onColorsChanged(TerminalSession s) { repaint(); }

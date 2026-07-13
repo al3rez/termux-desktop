@@ -48,14 +48,22 @@ public final class TerminalSession extends TerminalOutput {
                 while ((n = in.read(buf)) != -1) {
                     final byte[] chunk = buf;
                     final int len = n;
-                    javax.swing.SwingUtilities.invokeAndWait(() -> {
-                        mEmulator.append(chunk, len);
-                        mClient.onTextChanged(this);
-                    });
+                    try {
+                        javax.swing.SwingUtilities.invokeAndWait(() -> {
+                            mEmulator.append(chunk, len);
+                            try {
+                                mClient.onTextChanged(this);
+                            } catch (Exception e) {
+                                e.printStackTrace(System.err);
+                            }
+                        });
+                    } catch (Exception e) {
+                        e.printStackTrace(System.err);
+                    }
                 }
-            } catch (Exception ignored) {
+            } catch (IOException ignored) {
             }
-            mClient.onSessionFinished(this);
+            javax.swing.SwingUtilities.invokeLater(() -> mClient.onSessionFinished(this));
         }, "pty-reader");
         reader.setDaemon(true);
         reader.start();
@@ -64,7 +72,19 @@ public final class TerminalSession extends TerminalOutput {
     public void updateSize(int columns, int rows, int cellW, int cellH) {
         if (mEmulator == null) return;
         mEmulator.resize(columns, rows, cellW, cellH);
-        if (mProcess != null) mProcess.setWinSize(new WinSize(columns, rows));
+        int widthPixels = columns * cellW;
+        int heightPixels = rows * cellH;
+        if (mProcess != null) mProcess.setWinSize(new WinSize(columns, rows, widthPixels, heightPixels));
+    }
+
+    public void finish() {
+        if (mProcess != null) mProcess.destroy();
+        if (mPtyIn != null) {
+            try {
+                mPtyIn.close();
+            } catch (IOException ignored) {
+            }
+        }
     }
 
     public boolean isRunning() {

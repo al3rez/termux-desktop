@@ -129,6 +129,8 @@ public final class TerminalEmulator {
     private static final int DECSET_BIT_LEFTRIGHT_MARGIN_MODE = 1 << 11;
     /** Not really DECSET bit... - http://www.vt100.net/docs/vt510-rm/DECSACE */
     private static final int DECSET_BIT_RECTANGULAR_CHANGEATTRIBUTE = 1 << 12;
+    /** DEC private mode 2026 - synchronized output (desktop client repaint coalescing). */
+    private static final int DECSET_BIT_SYNCHRONIZED_OUTPUT = 1 << 13;
 
 
     private String mTitle;
@@ -319,6 +321,9 @@ public final class TerminalEmulator {
                 return DECSET_BIT_MOUSE_PROTOCOL_SGR;
             case 2004:
                 return DECSET_BIT_BRACKETED_PASTE_MODE;
+            // Keep this small addition local to the vendored DECSET table.
+            case 2026:
+                return DECSET_BIT_SYNCHRONIZED_OUTPUT;
             default:
                 return -1;
             // throw new IllegalArgumentException("Unsupported decset: " + decsetBit);
@@ -368,8 +373,9 @@ public final class TerminalEmulator {
         if (row < 1) row = 1;
         if (row > mRows) row = mRows;
 
-        if (mouseButton == MOUSE_LEFT_BUTTON_MOVED && !isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT)) {
-            // Do not send tracking.
+        if ((mouseButton & MOUSE_LEFT_BUTTON_MOVED) != 0 && !isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT)) {
+            // Do not send motion reports unless DECSET 1002 is active. The
+            // bit-5 test also covers middle/right-button motion from desktop.
         } else if (isDecsetInternalBitSet(DECSET_BIT_MOUSE_PROTOCOL_SGR)) {
             mSession.write(String.format("\033[<%d;%d;%d" + (pressed ? 'M' : 'm'), mouseButton, column, row));
         } else {
@@ -484,6 +490,11 @@ public final class TerminalEmulator {
     /** If mouse events are being sent as escape codes to the terminal. */
     public boolean isMouseTrackingActive() {
         return isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_PRESS_RELEASE) || isDecsetInternalBitSet(DECSET_BIT_MOUSE_TRACKING_BUTTON_EVENT);
+    }
+
+    /** True while DEC private mode 2026 asks the client to hold screen updates. */
+    public boolean isSynchronizedOutput() {
+        return isDecsetInternalBitSet(DECSET_BIT_SYNCHRONIZED_OUTPUT);
     }
 
     private void setDefaultTabStops() {
@@ -1239,6 +1250,7 @@ public final class TerminalEmulator {
             case 1006: // SGR Mouse Mode
             case 1015:
             case 1034: // Interpret "meta" key, sets eighth bit.
+            case 2026: // Synchronized output; the desktop client coalesces repaints.
                 break;
             case 1048: // Set: Save cursor as in DECSC. Reset: Restore cursor as in DECRC.
                 if (setting)

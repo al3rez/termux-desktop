@@ -8,6 +8,7 @@ import com.termux.terminal.TerminalSessionClient;
 import javax.swing.JComponent;
 import javax.swing.JFrame;
 import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Font;
@@ -21,6 +22,9 @@ import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.event.MouseWheelEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
@@ -39,6 +43,10 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     private int textSize;
     private final Font baseFont;
     private JFrame frame;
+    private final Timer synchronizedOutputTimer;
+    private boolean synchronizedOutputRepaintPending;
+    private int scrollOffset;
+    private int mouseButtonDown = -1;
 
     public static void main(String[] args) throws Exception {
         long startupNanos = System.nanoTime();
@@ -69,6 +77,13 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         setFocusable(true);
         setFocusTraversalKeysEnabled(false);
         setBackground(Color.BLACK);
+        synchronizedOutputTimer = new Timer(150, e -> {
+            if (synchronizedOutputRepaintPending) {
+                synchronizedOutputRepaintPending = false;
+                repaint();
+            }
+        });
+        synchronizedOutputTimer.setRepeats(false);
 
         addKeyListener(new KeyAdapter() {
             @Override
@@ -91,6 +106,44 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
                 resizeToComponent();
             }
         });
+
+        addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                TerminalEmulator emulator = emulator();
+                int button = terminalMouseButton(e.getButton());
+                if (emulator == null || button < 0) return;
+                if (emulator.isMouseTrackingActive()) {
+                    mouseButtonDown = button;
+                    emulator.sendMouseEvent(button, mouseColumn(e), mouseRow(e), true);
+                } else if (e.getButton() == MouseEvent.BUTTON2) {
+                    onPasteTextFromClipboard(session);
+                }
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                TerminalEmulator emulator = emulator();
+                int button = mouseButtonDown >= 0 ? mouseButtonDown : terminalMouseButton(e.getButton());
+                if (emulator != null && emulator.isMouseTrackingActive() && button >= 0)
+                    emulator.sendMouseEvent(button, mouseColumn(e), mouseRow(e), false);
+                mouseButtonDown = -1;
+            }
+        });
+
+        addMouseMotionListener(new MouseAdapter() {
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                TerminalEmulator emulator = emulator();
+                if (emulator == null || !emulator.isMouseTrackingActive() || mouseButtonDown < 0) return;
+                // Bit 5 is the xterm motion flag; the vendored emulator accepts
+                // it for all three buttons, while 32 remains its left-motion constant.
+                emulator.sendMouseEvent(mouseButtonDown | TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED,
+                    mouseColumn(e), mouseRow(e), true);
+            }
+        });
+
+        addMouseWheelListener(this::handleMouseWheel);
     }
 
     static Font loadFont(String fontPath, int size) throws Exception {
@@ -152,6 +205,67 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         textSize = Math.max(6, textSize + delta);
         renderer = new Java2DRenderer(textSize, baseFont);
         resizeToComponent();
+    }
+
+    private TerminalEmulator emulator() {
+        return session == null ? null : session.mEmulator;
+    }
+
+    private int mouseColumn(MouseEvent e) {
+        return (int) Math.floor(e.getX() / renderer.getFontWidth()) + 1;
+    }
+
+    private int mouseRow(MouseEvent e) {
+        return e.getY() / renderer.getFontLineSpacing() + 1;
+    }
+
+    private static int terminalMouseButton(int awtButton) {
+        switch (awtButton) {
+            case MouseEvent.BUTTON1: return TerminalEmulator.MOUSE_LEFT_BUTTON;
+            case MouseEvent.BUTTON2: return 1;
+            case MouseEvent.BUTTON3: return 2;
+            default: return -1;
+        }
+    }
+
+    private void handleMouseWheel(MouseWheelEvent e) {
+        TerminalEmulator emulator = emulator();
+        if (emulator == null || e.getWheelRotation() == 0) return;
+
+        int rotation = e.getWheelRotation();
+        int button = rotation < 0 ? TerminalEmulator.MOUSE_WHEELUP_BUTTON : TerminalEmulator.MOUSE_WHEELDOWN_BUTTON;
+        if (emulator.isMouseTrackingActive()) {
+            for (int i = 0; i < Math.abs(rotation); i++)
+                emulator.sendMouseEvent(button, mouseColumn(e), mouseRow(e), true);
+            return;
+        }
+
+        if (emulator.isAlternateBufferActive()) {
+            int keyCode = rotation < 0 ? android.view.KeyEvent.KEYCODE_DPAD_UP : android.view.KeyEvent.KEYCODE_DPAD_DOWN;
+            String code = KeyHandler.getCode(keyCode, 0, emulator.isCursorKeysApplicationMode(), emulator.isKeypadApplicationMode());
+            if (code != null) {
+                for (int i = 0; i < Math.abs(rotation); i++) session.writeString(code);
+            }
+            return;
+        }
+
+        int oldOffset = scrollOffset;
+        int maximumOffset = emulator.getScreen().getActiveTranscriptRows();
+        scrollOffset = Math.max(0, Math.min(maximumOffset, scrollOffset - rotation));
+        if (scrollOffset != oldOffset) repaint();
+    }
+
+    private void armSynchronizedOutputRepaint() {
+        synchronizedOutputRepaintPending = true;
+        synchronizedOutputTimer.restart();
+    }
+
+    private void requestRepaint(TerminalSession s) {
+        if (s != null && s.mEmulator != null && s.mEmulator.isSynchronizedOutput()) {
+            armSynchronizedOutputRepaint();
+        } else {
+            repaint();
+        }
     }
 
     private void handleKey(KeyEvent e) {
@@ -252,12 +366,23 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         if (session == null || session.mEmulator == null) return;
         g2.setColor(new Color(session.mEmulator.mColors.mCurrentColors[com.termux.terminal.TextStyle.COLOR_INDEX_BACKGROUND], true));
         g2.fillRect(0, 0, getWidth(), getHeight());
-        renderer.render(session.mEmulator, g2, 0, -1, -1, -1, -1);
+        int maximumOffset = session.mEmulator.isAlternateBufferActive() ? 0 : session.mEmulator.getScreen().getActiveTranscriptRows();
+        int topRow = session.mEmulator.isAlternateBufferActive() ? 0 : -Math.min(scrollOffset, maximumOffset);
+        renderer.render(session.mEmulator, g2, topRow, -1, -1, -1, -1);
     }
 
     // -- TerminalSessionClient --
 
-    @Override public void onTextChanged(TerminalSession s) { repaint(); }
+    @Override public void onTextChanged(TerminalSession s) {
+        if (s.mEmulator != null && s.mEmulator.isAlternateBufferActive()) scrollOffset = 0;
+        if (s.mEmulator != null && s.mEmulator.isSynchronizedOutput()) {
+            armSynchronizedOutputRepaint();
+            return;
+        }
+        synchronizedOutputRepaintPending = false;
+        synchronizedOutputTimer.stop();
+        repaint();
+    }
     @Override public void onTitleChanged(TerminalSession s) {
         JFrame f = (JFrame) SwingUtilities.getWindowAncestor(this);
         if (f != null && s.mEmulator != null) f.setTitle(String.valueOf(s.mEmulator.getTitle()));
@@ -287,8 +412,8 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         clipboardReader.start();
     }
     @Override public void onBell(TerminalSession s) { Toolkit.getDefaultToolkit().beep(); }
-    @Override public void onColorsChanged(TerminalSession s) { repaint(); }
-    @Override public void onTerminalCursorStateChange(boolean state) { repaint(); }
+    @Override public void onColorsChanged(TerminalSession s) { requestRepaint(s); }
+    @Override public void onTerminalCursorStateChange(boolean state) { requestRepaint(session); }
     @Override public void setTerminalShellPid(TerminalSession s, int pid) { }
     @Override public Integer getTerminalCursorStyle() { return null; }
     @Override public void logError(String tag, String message) { System.err.println(tag + ": " + message); }

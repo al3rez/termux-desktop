@@ -77,10 +77,10 @@ public final class Java2DRenderer {
         if (mFallbackFonts == null) {
             java.util.List<Font> fallbacks = new java.util.ArrayList<>();
             for (String path : new String[]{
-                // Symbols-only Nerd Font first: covers all NF private-use icons
-                // without text glyphs that could shadow later fallbacks.
-                "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
+                // Mono-advance nerd font first: SymbolsNerdFont-Regular's icons
+                // have wider advances that trigger run scaling ahead of a mono font.
                 "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
+                "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
                 System.getProperty("user.home") + "/.local/share/fonts/ArialMonospacedForSAPNerdFont-Regular.ttf",
             }) {
                 try {

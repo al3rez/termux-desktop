@@ -29,39 +29,26 @@ import java.nio.charset.StandardCharsets;
 /** Swing shell around Termux's TerminalEmulator + the Java2D port of its renderer. */
 public final class TermuxDesktop extends JComponent implements TerminalSessionClient {
 
-    private static long startupNanos;
+    static final String DEFAULT_FONT_PATH = System.getProperty("user.home") + "/.local/share/fonts/oplus/OplusOSUI-Regular.ttf";
+    static final int DEFAULT_FONT_SIZE = 20;
+
+    private final long startupNanos;
     private boolean startupReported;
     private Java2DRenderer renderer;
     private TerminalSession session;
     private int textSize;
     private final Font baseFont;
+    private JFrame frame;
 
     public static void main(String[] args) throws Exception {
-        startupNanos = System.nanoTime();
-        String fontPath = args.length > 0 ? args[0] : System.getProperty("user.home") + "/.local/share/fonts/oplus/OplusOSUI-Regular.ttf";
-        int size = args.length > 1 ? Integer.parseInt(args[1]) : 20;
-
-        File fontFile = new File(fontPath);
-        Font font = fontFile.exists()
-            ? Font.createFont(Font.TRUETYPE_FONT, fontFile)
-            : new Font(Font.MONOSPACED, Font.PLAIN, size);
+        long startupNanos = System.nanoTime();
+        String fontPath = args.length > 0 ? args[0] : DEFAULT_FONT_PATH;
+        int size = args.length > 1 ? Integer.parseInt(args[1]) : DEFAULT_FONT_SIZE;
+        Font font = loadFont(fontPath, size);
 
         SwingUtilities.invokeLater(() -> {
             try {
-                TermuxDesktop term = new TermuxDesktop(font, size);
-                JFrame frame = new JFrame("termux-desktop");
-                frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-                frame.addWindowListener(new WindowAdapter() {
-                    @Override
-                    public void windowClosing(WindowEvent e) {
-                        if (term.session != null) term.session.finish();
-                    }
-                });
-                frame.add(term);
-                frame.pack();
-                frame.setVisible(true);
-                term.requestFocusInWindow();
-                term.startShell();
+                openWindow(font, size, startupNanos);
             } catch (Exception e) {
                 e.printStackTrace();
                 System.exit(1);
@@ -70,8 +57,13 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
     }
 
     TermuxDesktop(Font font, int size) {
+        this(font, size, 0);
+    }
+
+    private TermuxDesktop(Font font, int size, long startupNanos) {
         baseFont = font;
         textSize = size;
+        this.startupNanos = startupNanos;
         renderer = new Java2DRenderer(textSize, baseFont);
         setPreferredSize(new Dimension((int) (renderer.getFontWidth() * 90), renderer.getFontLineSpacing() * 28));
         setFocusable(true);
@@ -99,6 +91,44 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
                 resizeToComponent();
             }
         });
+    }
+
+    static Font loadFont(String fontPath, int size) throws Exception {
+        File fontFile = new File(fontPath);
+        return fontFile.exists()
+            ? Font.createFont(Font.TRUETYPE_FONT, fontFile)
+            : new Font(Font.MONOSPACED, Font.PLAIN, size);
+    }
+
+    static JFrame openWindow(Font font, int size) throws Exception {
+        return openWindow(font, size, 0);
+    }
+
+    private static JFrame openWindow(Font font, int size, long startupNanos) throws Exception {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            throw new IllegalStateException("Terminal windows must be opened on the EDT");
+        }
+
+        TermuxDesktop term = new TermuxDesktop(font, size, startupNanos);
+        JFrame frame = new JFrame("termux-desktop");
+        term.frame = frame;
+        frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+        frame.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                term.finishSession();
+            }
+        });
+        frame.add(term);
+        frame.pack();
+        term.startShell();
+        frame.setVisible(true);
+        term.requestFocusInWindow();
+        return frame;
+    }
+
+    private void finishSession() {
+        if (session != null) session.finish();
     }
 
     void startShell() throws Exception {
@@ -212,7 +242,7 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
 
     @Override
     protected void paintComponent(Graphics g) {
-        if (!startupReported) {
+        if (!startupReported && startupNanos != 0) {
             startupReported = true;
             System.err.println("startup-ms: " + ((System.nanoTime() - startupNanos) / 1_000_000L));
         }
@@ -232,7 +262,9 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         JFrame f = (JFrame) SwingUtilities.getWindowAncestor(this);
         if (f != null && s.mEmulator != null) f.setTitle(String.valueOf(s.mEmulator.getTitle()));
     }
-    @Override public void onSessionFinished(TerminalSession s) { System.exit(0); }
+    @Override public void onSessionFinished(TerminalSession s) {
+        if (frame != null) frame.dispose();
+    }
     @Override public void onCopyTextToClipboard(TerminalSession s, String text) {
         Thread clipboardWriter = new Thread(() -> {
             try {

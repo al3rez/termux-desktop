@@ -4,6 +4,8 @@ APP_HOME="$(cd "$(dirname "$0")/.." && pwd)"
 CACHE_DIR="$HOME/.cache/termux-desktop"
 CLASSES_JAR="$CACHE_DIR/app-classes.jar"
 CDS_ARCHIVE="$CACHE_DIR/app.jsa"
+SOCKET_PATH="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}/termux-desktop.sock"
+DAEMON_LOG="$CACHE_DIR/daemon.log"
 
 mkdir -p "$CACHE_DIR"
 
@@ -20,10 +22,61 @@ else
   CDS_FLAGS=(-Xshare:auto -XX:ArchiveClassesAtExit="$CDS_ARCHIVE")
 fi
 
-exec java \
-  -Dsun.java2d.opengl=true \
-  -Dawt.useSystemAAFontSettings=on \
-  -Dswing.aatext=true \
-  "${CDS_FLAGS[@]}" \
-  -cp "$CLASSES_JAR:$APP_HOME/lib/*" \
-  com.termux.desktop.TermuxDesktop "$@"
+JAVA_CMD=(
+  java
+  -Dsun.java2d.opengl=true
+  -Dawt.useSystemAAFontSettings=on
+  -Dswing.aatext=true
+  "${CDS_FLAGS[@]}"
+  -cp "$CLASSES_JAR:$APP_HOME/lib/*"
+)
+
+if [[ "${1:-}" == "--no-daemon" ]]; then
+  shift
+  exec "${JAVA_CMD[@]}" com.termux.desktop.TermuxDesktop "$@"
+fi
+
+FONT_PATH="${1:-$HOME/.local/share/fonts/oplus/OplusOSUI-Regular.ttf}"
+FONT_SIZE="${2:-20}"
+if [[ "$FONT_PATH" == *$'\n'* || "$FONT_SIZE" == *$'\n'* ]]; then
+  echo "termux-desktop: font path and size must not contain newlines" >&2
+  exit 2
+fi
+REQUEST="open $FONT_PATH $FONT_SIZE"
+
+send_request() {
+  if command -v socat >/dev/null 2>&1; then
+    printf '%s\n' "$REQUEST" | socat -t 1 - "UNIX-CONNECT:$SOCKET_PATH" 2>/dev/null
+  else
+    python3 -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1)
+s.connect(sys.argv[1])
+s.sendall((sys.argv[2] + "\n").encode())
+data = b""
+while not data.endswith(b"\n"):
+    chunk = s.recv(4096)
+    if not chunk: break
+    data += chunk
+sys.stdout.write(data.decode())' "$SOCKET_PATH" "$REQUEST" 2>/dev/null
+  fi
+}
+
+if RESPONSE="$(send_request)" && [[ "$RESPONSE" == ok\ * ]]; then
+  printf '%s\n' "$RESPONSE"
+  exit 0
+fi
+
+setsid "${JAVA_CMD[@]}" com.termux.desktop.TermuxDesktopDaemon \
+  </dev/null >>"$DAEMON_LOG" 2>&1 &
+
+for _ in {1..100}; do
+  if RESPONSE="$(send_request)" && [[ "$RESPONSE" == ok\ * ]]; then
+    printf '%s\n' "$RESPONSE"
+    exit 0
+  fi
+  sleep 0.05
+done
+
+echo "termux-desktop: daemon did not become ready; see $DAEMON_LOG" >&2
+exit 1

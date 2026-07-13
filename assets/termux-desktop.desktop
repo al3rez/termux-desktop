@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Termux Desktop
+Comment=Termux terminal engine on the desktop
+Exec=termux-desktop
+Icon=termux-desktop
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=com-termux-desktop-TermuxDesktopDaemon

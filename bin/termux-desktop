@@ -12,6 +12,7 @@ mkdir -p "$CACHE_DIR"
 # AppCDS cannot archive classes loaded from the non-empty out/ directory.
 # Keep a cache-side JAR in sync so the archive has a stable class path.
 if [[ ! -f "$CLASSES_JAR" || -n "$(find "$APP_HOME/out" -type f -newer "$CLASSES_JAR" -print -quit)" ]]; then
+  cp -f "$APP_HOME/assets/termux-desktop.png" "$APP_HOME/out/" 2>/dev/null || true
   jar --create --file "$CLASSES_JAR" -C "$APP_HOME/out" .
   rm -f "$CDS_ARCHIVE"
 fi

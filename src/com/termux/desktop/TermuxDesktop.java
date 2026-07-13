@@ -164,6 +164,8 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
 
         TermuxDesktop term = new TermuxDesktop(font, size, startupNanos);
         JFrame frame = new JFrame("termux-desktop");
+        java.awt.Image icon = loadAppIcon();
+        if (icon != null) frame.setIconImage(icon);
         term.frame = frame;
         frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         frame.addWindowListener(new WindowAdapter() {
@@ -178,6 +180,21 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
         frame.setVisible(true);
         term.requestFocusInWindow();
         return frame;
+    }
+
+    private static java.awt.Image appIcon;
+
+    /** The Termux launcher icon: from the classpath (jarred out/ dir), or the installed hicolor copy. */
+    private static java.awt.Image loadAppIcon() {
+        if (appIcon != null) return appIcon;
+        try {
+            java.net.URL res = TermuxDesktop.class.getResource("/termux-desktop.png");
+            if (res != null) return appIcon = javax.imageio.ImageIO.read(res);
+            File installed = new File(System.getProperty("user.home") + "/.local/share/icons/hicolor/192x192/apps/termux-desktop.png");
+            if (installed.exists()) return appIcon = javax.imageio.ImageIO.read(installed);
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private void finishSession() {

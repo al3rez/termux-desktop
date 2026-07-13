@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Termux terminal engine on desktop (Java2D port). OpenGL pipeline for GPU rendering.
+APP_HOME="$(cd "$(dirname "$0")/.." && pwd)"
+CACHE_DIR="$HOME/.cache/termux-desktop"
+CLASSES_JAR="$CACHE_DIR/app-classes.jar"
+CDS_ARCHIVE="$CACHE_DIR/app.jsa"
+
+mkdir -p "$CACHE_DIR"
+
+# AppCDS cannot archive classes loaded from the non-empty out/ directory.
+# Keep a cache-side JAR in sync so the archive has a stable class path.
+if [[ ! -f "$CLASSES_JAR" || -n "$(find "$APP_HOME/out" -type f -newer "$CLASSES_JAR" -print -quit)" ]]; then
+  jar --create --file "$CLASSES_JAR" -C "$APP_HOME/out" .
+  rm -f "$CDS_ARCHIVE"
+fi
+
+if [[ -f "$CDS_ARCHIVE" ]]; then
+  CDS_FLAGS=(-Xshare:auto -XX:SharedArchiveFile="$CDS_ARCHIVE")
+else
+  CDS_FLAGS=(-Xshare:auto -XX:ArchiveClassesAtExit="$CDS_ARCHIVE")
+fi
+
+exec java \
+  -Dsun.java2d.opengl=true \
+  -Dawt.useSystemAAFontSettings=on \
+  -Dswing.aatext=true \
+  "${CDS_FLAGS[@]}" \
+  -cp "$CLASSES_JAR:$APP_HOME/lib/*" \
+  com.termux.desktop.TermuxDesktop "$@"

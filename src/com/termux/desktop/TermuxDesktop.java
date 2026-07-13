@@ -29,12 +29,15 @@ import java.nio.charset.StandardCharsets;
 /** Swing shell around Termux's TerminalEmulator + the Java2D port of its renderer. */
 public final class TermuxDesktop extends JComponent implements TerminalSessionClient {
 
+    private static long startupNanos;
+    private boolean startupReported;
     private Java2DRenderer renderer;
     private TerminalSession session;
     private int textSize;
     private final Font baseFont;
 
     public static void main(String[] args) throws Exception {
+        startupNanos = System.nanoTime();
         String fontPath = args.length > 0 ? args[0] : System.getProperty("user.home") + "/.local/share/fonts/oplus/OplusOSUI-Regular.ttf";
         int size = args.length > 1 ? Integer.parseInt(args[1]) : 20;
 
@@ -209,6 +212,10 @@ public final class TermuxDesktop extends JComponent implements TerminalSessionCl
 
     @Override
     protected void paintComponent(Graphics g) {
+        if (!startupReported) {
+            startupReported = true;
+            System.err.println("startup-ms: " + ((System.nanoTime() - startupNanos) / 1_000_000L));
+        }
         Graphics2D g2 = (Graphics2D) g;
         g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
         g2.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_ON);

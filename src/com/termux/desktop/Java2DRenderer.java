@@ -36,34 +36,20 @@ public final class Java2DRenderer {
 
     private final FontMetrics mMetrics;
     private final float[] asciiMeasures = new float[127];
+    private final boolean[] asciiMeasureReady = new boolean[127];
 
     /**
      * Fallback fonts for glyphs the main font lacks (box drawing, nerd font
      * symbols, emoji). Android's renderer gets this for free from the system;
      * Java2D fonts do not fall back, so pick per code point via canDisplay().
      */
-    private final Font[] mFallbackFonts;
+    private Font[] mFallbackFonts;
 
     public Java2DRenderer(int textSize, Font font) {
         mTextSize = textSize;
         mFont = font.deriveFont((float) textSize);
         mFontBold = mFont.deriveFont(Font.BOLD);
         mFontItalic = mFont.deriveFont(AffineTransform.getShearInstance(-0.35, 0));
-
-        java.util.List<Font> fallbacks = new java.util.ArrayList<>();
-        for (String path : new String[]{
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-            System.getProperty("user.home") + "/.local/share/fonts/ArialMonospacedForSAPNerdFont-Regular.ttf",
-        }) {
-            try {
-                fallbacks.add(Font.createFont(Font.TRUETYPE_FONT, new java.io.File(path)).deriveFont((float) textSize));
-            } catch (Exception ignored) {
-            }
-        }
-        // Logical font last: the JRE composes it from fontconfig, so it covers
-        // nearly everything (CJK, emoji, symbols) that the explicit ones miss.
-        fallbacks.add(new Font(Font.MONOSPACED, Font.PLAIN, textSize));
-        mFallbackFonts = fallbacks.toArray(new Font[0]);
 
         BufferedImage img = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g = img.createGraphics();
@@ -76,26 +62,50 @@ public final class Java2DRenderer {
         mFontAscent = -(int) Math.ceil(mMetrics.getAscent());
         mFontLineSpacingAndAscent = mFontLineSpacing + mFontAscent;
         mFontWidth = (float) mFont.getStringBounds("X", mMetrics.getFontRenderContext()).getWidth();
-
-        char[] c = new char[1];
-        for (int i = 0; i < asciiMeasures.length; i++) {
-            c[0] = (char) i;
-            asciiMeasures[i] = measure(c, 0, 1);
-        }
     }
 
     /** The font to draw/measure a code point with: the main font, or the first fallback that has the glyph. */
     private Font fontFor(int codePoint) {
         if (mFont.canDisplay(codePoint)) return mFont;
-        for (Font f : mFallbackFonts) {
+        for (Font f : fallbackFonts()) {
             if (f.canDisplay(codePoint)) return f;
         }
         return mFont;
     }
 
+    private Font[] fallbackFonts() {
+        if (mFallbackFonts == null) {
+            java.util.List<Font> fallbacks = new java.util.ArrayList<>();
+            for (String path : new String[]{
+                "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
+                System.getProperty("user.home") + "/.local/share/fonts/ArialMonospacedForSAPNerdFont-Regular.ttf",
+            }) {
+                try {
+                    fallbacks.add(Font.createFont(Font.TRUETYPE_FONT, new java.io.File(path)).deriveFont((float) mTextSize));
+                } catch (Exception ignored) {
+                }
+            }
+            // Logical font last: the JRE composes it from fontconfig, so it covers
+            // nearly everything (CJK, emoji, symbols) that the explicit ones miss.
+            fallbacks.add(new Font(Font.MONOSPACED, Font.PLAIN, mTextSize));
+            mFallbackFonts = fallbacks.toArray(new Font[0]);
+        }
+        return mFallbackFonts;
+    }
+
     private float measure(char[] chars, int start, int count) {
         int codePoint = Character.codePointAt(chars, start);
         return (float) fontFor(codePoint).getStringBounds(chars, start, start + count, mMetrics.getFontRenderContext()).getWidth();
+    }
+
+    private float measureCodePoint(char[] chars, int start, int count, int codePoint) {
+        if (codePoint < asciiMeasures.length && asciiMeasureReady[codePoint]) return asciiMeasures[codePoint];
+        float width = measure(chars, start, count);
+        if (codePoint < asciiMeasures.length) {
+            asciiMeasures[codePoint] = width;
+            asciiMeasureReady[codePoint] = true;
+        }
+        return width;
     }
 
     public final void render(TerminalEmulator mEmulator, Graphics2D canvas, int topRow,
@@ -150,8 +160,7 @@ public final class Java2DRenderer {
                 final boolean insideSelection = column >= selx1 && column <= selx2;
                 final long style = lineObject.getStyle(column);
 
-                final float measuredCodePointWidth = (codePoint < asciiMeasures.length) ? asciiMeasures[codePoint]
-                    : measure(line, currentCharIndex, charsForCodePoint);
+                final float measuredCodePointWidth = measureCodePoint(line, currentCharIndex, charsForCodePoint, codePoint);
                 final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
                 final Font fontForCodePoint = fontFor(codePoint);
 

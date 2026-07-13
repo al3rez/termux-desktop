@@ -11,6 +11,7 @@ import java.awt.Font;
 import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.font.TextAttribute;
+import java.awt.font.TextLayout;
 import java.awt.geom.AffineTransform;
 import java.awt.geom.Rectangle2D;
 import java.awt.image.BufferedImage;
@@ -38,6 +39,13 @@ public final class Java2DRenderer {
     private final float[] asciiMeasures = new float[127];
     private final boolean[] asciiMeasureReady = new boolean[127];
 
+    private static final String COLOR_EMOJI_FONT_PATH = "/usr/share/fonts/noto/NotoColorEmoji.ttf";
+    private static final String EMOJI_PROBE = "\uD83D\uDE00";
+    private static final int EMOJI_RENDER_DRAW_STRING = 1;
+    private static final int EMOJI_RENDER_TEXT_LAYOUT = 2;
+    private final Font mEmojiFont;
+    private final int mEmojiRenderMode;
+
     /**
      * Fallback fonts for glyphs the main font lacks (box drawing, nerd font
      * symbols, emoji). Android's renderer gets this for free from the system;
@@ -62,10 +70,15 @@ public final class Java2DRenderer {
         mFontAscent = -(int) Math.ceil(mMetrics.getAscent());
         mFontLineSpacingAndAscent = mFontLineSpacing + mFontAscent;
         mFontWidth = (float) mFont.getStringBounds("X", mMetrics.getFontRenderContext()).getWidth();
+
+        EmojiSupport emojiSupport = findEmojiSupport();
+        mEmojiFont = emojiSupport.font;
+        mEmojiRenderMode = emojiSupport.renderMode;
     }
 
     /** The font to draw/measure a code point with: the main font, or the first fallback that has the glyph. */
     private Font fontFor(int codePoint) {
+        if (codePoint >= 0x1F000 && codePoint <= 0x1FAFF && mEmojiFont != null) return mEmojiFont;
         if (mFont.canDisplay(codePoint)) return mFont;
         for (Font f : fallbackFonts()) {
             if (f.canDisplay(codePoint)) return f;
@@ -81,6 +94,7 @@ public final class Java2DRenderer {
                 // have wider advances that trigger run scaling ahead of a mono font.
                 "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
                 "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
                 System.getProperty("user.home") + "/.local/share/fonts/ArialMonospacedForSAPNerdFont-Regular.ttf",
             }) {
                 try {
@@ -94,6 +108,113 @@ public final class Java2DRenderer {
             mFallbackFonts = fallbacks.toArray(new Font[0]);
         }
         return mFallbackFonts;
+    }
+
+    private static final class EmojiSupport {
+        final Font font;
+        final int renderMode;
+
+        EmojiSupport(Font font, int renderMode) {
+            this.font = font;
+            this.renderMode = renderMode;
+        }
+    }
+
+    /**
+     * Probe the installed color font instead of trusting Font.canDisplay().
+     * Temurin 17 can load Noto Color Emoji's fixed-size CBDT font, but on this
+     * Linux runtime it produces an empty glyph through both Java2D APIs.
+     */
+    private EmojiSupport findEmojiSupport() {
+        Font colorFont = loadFont(COLOR_EMOJI_FONT_PATH);
+        if (colorFont != null) {
+            colorFont = colorFont.deriveFont((float) mTextSize);
+            int colorRenderMode = probeColorEmoji(colorFont);
+            if (colorRenderMode != 0) return new EmojiSupport(colorFont, colorRenderMode);
+        }
+
+        // DejaVu Sans contains useful monochrome emoji outlines even when the
+        // terminal's selected mono face does not. Prefer the caller's face if
+        // it really renders the probe; this avoids replacing an installed
+        // emoji-capable terminal font with a different outline.
+        if (canRenderGlyph(mFont, 0x1F600)) return new EmojiSupport(mFont, 0);
+        Font monoEmoji = loadFont("/usr/share/fonts/TTF/DejaVuSans.ttf");
+        if (monoEmoji != null) {
+            monoEmoji = monoEmoji.deriveFont((float) mTextSize);
+            if (canRenderGlyph(monoEmoji, 0x1F600)) return new EmojiSupport(monoEmoji, 0);
+        }
+
+        Font logicalSans = new Font(Font.SANS_SERIF, Font.PLAIN, mTextSize);
+        if (canRenderGlyph(logicalSans, 0x1F600)) return new EmojiSupport(logicalSans, 0);
+        return new EmojiSupport(mFont, 0);
+    }
+
+    private static Font loadFont(String path) {
+        try {
+            return Font.createFont(Font.TRUETYPE_FONT, new java.io.File(path));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static int probeColorEmoji(Font font) {
+        for (int renderMode : new int[]{EMOJI_RENDER_DRAW_STRING, EMOJI_RENDER_TEXT_LAYOUT}) {
+            BufferedImage image = new BufferedImage(96, 96, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = image.createGraphics();
+            g.setColor(Color.WHITE);
+            g.fillRect(0, 0, image.getWidth(), image.getHeight());
+            g.setRenderingHint(java.awt.RenderingHints.KEY_TEXT_ANTIALIASING,
+                java.awt.RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            g.setColor(Color.BLACK);
+            g.setFont(font);
+            if (renderMode == EMOJI_RENDER_DRAW_STRING) {
+                g.drawString(EMOJI_PROBE, 4, 72);
+            } else {
+                new TextLayout(EMOJI_PROBE, font, g.getFontRenderContext()).draw(g, 4, 72);
+            }
+            boolean colored = hasColoredPixels(image);
+            g.dispose();
+            if (colored) return renderMode;
+        }
+        return 0;
+    }
+
+    private static boolean canRenderGlyph(Font font, int codePoint) {
+        if (font == null || !font.canDisplay(codePoint)) return false;
+        BufferedImage image = new BufferedImage(64, 64, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = image.createGraphics();
+        g.setColor(Color.WHITE);
+        g.fillRect(0, 0, image.getWidth(), image.getHeight());
+        g.setRenderingHint(java.awt.RenderingHints.KEY_TEXT_ANTIALIASING,
+            java.awt.RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+        g.setColor(Color.BLACK);
+        g.setFont(font);
+        g.drawString(new String(Character.toChars(codePoint)), 4, Math.max(16, font.getSize()));
+        boolean inked = hasInk(image);
+        g.dispose();
+        return inked;
+    }
+
+    private static boolean hasInk(BufferedImage image) {
+        for (int y = 0; y < image.getHeight(); y++) {
+            for (int x = 0; x < image.getWidth(); x++) {
+                if ((image.getRGB(x, y) & 0xFFFFFF) != 0xFFFFFF) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasColoredPixels(BufferedImage image) {
+        for (int y = 0; y < image.getHeight(); y++) {
+            for (int x = 0; x < image.getWidth(); x++) {
+                int rgb = image.getRGB(x, y);
+                int red = (rgb >> 16) & 0xFF;
+                int green = (rgb >> 8) & 0xFF;
+                int blue = rgb & 0xFF;
+                if (Math.max(red, Math.max(green, blue)) - Math.min(red, Math.min(green, blue)) > 12) return true;
+            }
+        }
+        return false;
     }
 
     private float measure(char[] chars, int start, int count) {
@@ -112,6 +233,115 @@ public final class Java2DRenderer {
             asciiMeasureReady[codePoint] = true;
         }
         return width;
+    }
+
+    private static final class EmojiCluster {
+        final int charCount;
+        final int terminalWidth;
+        final int visualWidth;
+        final int firstCodePoint;
+        final boolean regionalPair;
+        final boolean hasZwj;
+
+        EmojiCluster(int charCount, int terminalWidth, int visualWidth, int firstCodePoint,
+                     boolean regionalPair, boolean hasZwj) {
+            this.charCount = charCount;
+            this.terminalWidth = terminalWidth;
+            this.visualWidth = visualWidth;
+            this.firstCodePoint = firstCodePoint;
+            this.regionalPair = regionalPair;
+            this.hasZwj = hasZwj;
+        }
+    }
+
+    /** Group the emoji sequences that the terminal row stores in one or more cells. */
+    private static EmojiCluster emojiClusterAt(char[] chars, int start, int limit) {
+        if (start >= limit) return null;
+        int firstCodePoint = codePointAt(chars, start, limit);
+        int firstChars = codePointCharCount(chars, start, limit);
+        int next = start + firstChars;
+
+        if (isRegionalIndicator(firstCodePoint)) {
+            if (next < limit) {
+                int second = codePointAt(chars, next, limit);
+                if (isRegionalIndicator(second)) {
+                    int secondChars = codePointCharCount(chars, next, limit);
+                    return new EmojiCluster(firstChars + secondChars, 2, 2, firstCodePoint, true, false);
+                }
+            }
+            return new EmojiCluster(firstChars, 1, 1, firstCodePoint, false, false);
+        }
+
+        boolean hasEmojiVariation = next < limit && codePointAt(chars, next, limit) == 0xFE0F;
+        boolean emojiBase = isEmojiBaseCodePoint(firstCodePoint)
+            && (firstCodePoint >= 0x1F000 || WcWidth.width(firstCodePoint) == 2);
+        if (!emojiBase && !hasEmojiVariation) return null;
+
+        int index = next;
+        int terminalWidth = Math.max(1, WcWidth.width(firstCodePoint));
+        boolean hasZwj = false;
+        while (index < limit) {
+            int codePoint = codePointAt(chars, index, limit);
+            int codePointChars = codePointCharCount(chars, index, limit);
+            if (isVariationSelector(codePoint) || isEmojiModifier(codePoint)
+                || (WcWidth.width(codePoint) <= 0 && codePoint != 0x200D)) {
+                index += codePointChars;
+                continue;
+            }
+            if (codePoint != 0x200D) break;
+
+            int componentStart = index + codePointChars;
+            if (componentStart >= limit) {
+                index = componentStart; // Do not leave a trailing ZWJ to become tofu.
+                break;
+            }
+            int component = codePointAt(chars, componentStart, limit);
+            if (!isEmojiBaseCodePoint(component)) break;
+            hasZwj = true;
+            int componentChars = codePointCharCount(chars, componentStart, limit);
+            terminalWidth += Math.max(1, WcWidth.width(component));
+            index = componentStart + componentChars;
+        }
+        return new EmojiCluster(index - start, terminalWidth, 2, firstCodePoint, false, hasZwj);
+    }
+
+    private static int codePointAt(char[] chars, int index, int limit) {
+        char c = chars[index];
+        if (Character.isHighSurrogate(c) && index + 1 < limit && Character.isLowSurrogate(chars[index + 1])) {
+            return Character.toCodePoint(c, chars[index + 1]);
+        }
+        return c;
+    }
+
+    private static int codePointCharCount(char[] chars, int index, int limit) {
+        return Character.isHighSurrogate(chars[index]) && index + 1 < limit
+            && Character.isLowSurrogate(chars[index + 1]) ? 2 : 1;
+    }
+
+    private static boolean isVariationSelector(int codePoint) {
+        return (codePoint >= 0xFE00 && codePoint <= 0xFE0F)
+            || (codePoint >= 0xE0100 && codePoint <= 0xE01EF);
+    }
+
+    private static boolean isEmojiModifier(int codePoint) {
+        return codePoint >= 0x1F3FB && codePoint <= 0x1F3FF;
+    }
+
+    private static boolean isRegionalIndicator(int codePoint) {
+        return codePoint >= 0x1F1E6 && codePoint <= 0x1F1FF;
+    }
+
+    private static boolean isEmojiBaseCodePoint(int codePoint) {
+        if (codePoint >= 0x1F000 && codePoint <= 0x1FAFF) return true;
+        if (codePoint >= 0x2600 && codePoint <= 0x27BF) return true;
+        switch (codePoint) {
+            case 0x00A9: case 0x00AE: case 0x203C: case 0x2049:
+            case 0x2122: case 0x2139: case 0x3030: case 0x303D:
+            case 0x3297: case 0x3299:
+                return true;
+            default:
+                return false;
+        }
     }
 
     public final void render(TerminalEmulator mEmulator, Graphics2D canvas, int topRow,
@@ -156,20 +386,26 @@ public final class Java2DRenderer {
             int currentCharIndex = 0;
             float measuredWidthForRun = 0.f;
 
-            for (int column = 0; column < columns; ) {
-                final char charAtIndex = line[currentCharIndex];
-                final boolean charIsHighsurrogate = Character.isHighSurrogate(charAtIndex);
-                final int charsForCodePoint = charIsHighsurrogate ? 2 : 1;
-                final int codePoint = charIsHighsurrogate ? Character.toCodePoint(charAtIndex, line[currentCharIndex + 1]) : charAtIndex;
+            int column = 0; // Visual column; emoji sequences may normalize to two cells.
+            int terminalColumn = 0;
+            while (terminalColumn < columns && currentCharIndex < charsUsedInLine) {
+                final int charsForCodePoint = codePointCharCount(line, currentCharIndex, charsUsedInLine);
+                final int codePoint = codePointAt(line, currentCharIndex, charsUsedInLine);
                 final int codePointWcWidth = WcWidth.width(codePoint);
-                final boolean insideCursor = (cursorX == column || (codePointWcWidth == 2 && cursorX == column + 1));
-                final boolean insideSelection = column >= selx1 && column <= selx2;
-                final long style = lineObject.getStyle(column);
+                final EmojiCluster emoji = emojiClusterAt(line, currentCharIndex, charsUsedInLine);
+                final int terminalWidth = emoji == null ? codePointWcWidth : emoji.terminalWidth;
+                final int visualWidth = emoji == null ? codePointWcWidth : emoji.visualWidth;
+                final boolean insideCursor = emoji != null
+                    ? cursorX >= terminalColumn && cursorX < terminalColumn + terminalWidth
+                    : (cursorX == terminalColumn || (codePointWcWidth == 2 && cursorX == terminalColumn + 1));
+                final boolean insideSelection = terminalColumn <= selx2
+                    && terminalColumn + Math.max(1, terminalWidth) - 1 >= selx1;
+                final long style = lineObject.getStyle(terminalColumn);
                 final boolean geometric = isGeometricCodePoint(codePoint);
 
                 if (geometric) {
                     if (lastRunStartColumn >= 0) {
-                        final int columnWidthSinceLastRun = column - lastRunStartColumn;
+                        final int columnWidthSinceLastRun = Math.max(0, column - lastRunStartColumn);
                         final int charsSinceLastRun = currentCharIndex - lastRunStartIndex;
                         int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
                         boolean invertCursorTextColor = lastRunInsideCursor && cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK;
@@ -189,10 +425,33 @@ public final class Java2DRenderer {
                         reverseVideo || invertCursorTextColor || insideSelection);
 
                     column += codePointWcWidth;
+                    terminalColumn += codePointWcWidth;
                     currentCharIndex += charsForCodePoint;
                     while (currentCharIndex < charsUsedInLine && WcWidth.width(line, currentCharIndex) <= 0) {
-                        currentCharIndex += Character.isHighSurrogate(line[currentCharIndex]) ? 2 : 1;
+                        currentCharIndex += codePointCharCount(line, currentCharIndex, charsUsedInLine);
                     }
+                    continue;
+                }
+
+                if (emoji != null) {
+                    if (lastRunStartColumn >= 0) {
+                        final int columnWidthSinceLastRun = Math.max(0, column - lastRunStartColumn);
+                        final int charsSinceLastRun = currentCharIndex - lastRunStartIndex;
+                        int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
+                        boolean invertCursorTextColor = lastRunInsideCursor && cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK;
+                        drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun,
+                            lastRunStartIndex, charsSinceLastRun, measuredWidthForRun,
+                            cursorColor, cursorShape, lastRunStyle, reverseVideo || invertCursorTextColor || lastRunInsideSelection, lastRunFont);
+                        lastRunStartColumn = -1;
+                    }
+                    int cursorColor = insideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
+                    boolean invertCursorTextColor = insideCursor && cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK;
+                    drawEmojiRun(canvas, palette, heightOffset, column, visualWidth,
+                        new String(line, currentCharIndex, emoji.charCount), emoji, style,
+                        cursorColor, cursorShape, reverseVideo || invertCursorTextColor || insideSelection);
+                    column += visualWidth;
+                    terminalColumn += terminalWidth;
+                    currentCharIndex += emoji.charCount;
                     continue;
                 }
 
@@ -202,7 +461,7 @@ public final class Java2DRenderer {
 
                 if (lastRunStartColumn < 0 || style != lastRunStyle || fontForCodePoint != lastRunFont || insideCursor != lastRunInsideCursor || insideSelection != lastRunInsideSelection || fontWidthMismatch || lastRunFontWidthMismatch) {
                     if (lastRunStartColumn >= 0) {
-                        final int columnWidthSinceLastRun = column - lastRunStartColumn;
+                        final int columnWidthSinceLastRun = Math.max(0, column - lastRunStartColumn);
                         final int charsSinceLastRun = currentCharIndex - lastRunStartIndex;
                         int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
                         boolean invertCursorTextColor = lastRunInsideCursor && cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK;
@@ -221,14 +480,15 @@ public final class Java2DRenderer {
                 }
                 measuredWidthForRun += measuredCodePointWidth;
                 column += codePointWcWidth;
+                terminalColumn += codePointWcWidth;
                 currentCharIndex += charsForCodePoint;
                 while (currentCharIndex < charsUsedInLine && WcWidth.width(line, currentCharIndex) <= 0) {
-                    currentCharIndex += Character.isHighSurrogate(line[currentCharIndex]) ? 2 : 1;
+                    currentCharIndex += codePointCharCount(line, currentCharIndex, charsUsedInLine);
                 }
             }
 
             if (lastRunStartColumn >= 0) {
-                final int columnWidthSinceLastRun = columns - lastRunStartColumn;
+                final int columnWidthSinceLastRun = Math.max(0, columns - lastRunStartColumn);
                 final int charsSinceLastRun = currentCharIndex - lastRunStartIndex;
                 int cursorColor = lastRunInsideCursor ? mEmulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] : 0;
                 boolean invertCursorTextColor = lastRunInsideCursor && cursorShape == TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK;
@@ -585,6 +845,121 @@ public final class Java2DRenderer {
         }
     }
 
+    /** Draw an emoji cluster in its visual cell span without normal-run scaling. */
+    private void drawEmojiRun(Graphics2D canvas, int[] palette, float y, int startColumn, int widthColumns,
+                              String clusterText, EmojiCluster cluster, long textStyle,
+                              int cursor, int cursorStyle, boolean reverseVideo) {
+        int foreColor = TextStyle.decodeForeColor(textStyle);
+        final int effect = TextStyle.decodeEffect(textStyle);
+        int backColor = TextStyle.decodeBackColor(textStyle);
+        final boolean bold = (effect & (TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_BLINK)) != 0;
+        final boolean underline = (effect & TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE) != 0;
+        final boolean italic = (effect & TextStyle.CHARACTER_ATTRIBUTE_ITALIC) != 0;
+        final boolean strikeThrough = (effect & TextStyle.CHARACTER_ATTRIBUTE_STRIKETHROUGH) != 0;
+
+        if ((foreColor & 0xff000000) != 0xff000000) {
+            if (bold && foreColor >= 0 && foreColor < 8) foreColor += 8;
+            foreColor = palette[foreColor];
+        }
+        if ((backColor & 0xff000000) != 0xff000000) backColor = palette[backColor];
+
+        final boolean reverseVideoHere = reverseVideo ^ (effect & TextStyle.CHARACTER_ATTRIBUTE_INVERSE) != 0;
+        if (reverseVideoHere) {
+            int tmp = foreColor;
+            foreColor = backColor;
+            backColor = tmp;
+        }
+
+        float left = startColumn * mFontWidth;
+        float width = widthColumns * mFontWidth;
+        if (backColor != palette[TextStyle.COLOR_INDEX_BACKGROUND]) {
+            canvas.setColor(new Color(backColor, true));
+            canvas.fill(new Rectangle2D.Float(left, y - mFontLineSpacingAndAscent + mFontAscent,
+                width, mFontLineSpacingAndAscent - mFontAscent));
+        }
+
+        if (cursor != 0) {
+            canvas.setColor(new Color(cursor, true));
+            float cursorHeight = mFontLineSpacingAndAscent - mFontAscent;
+            float cRight = left + width;
+            if (cursorStyle == TerminalEmulator.TERMINAL_CURSOR_STYLE_UNDERLINE) cursorHeight /= 4.f;
+            else if (cursorStyle == TerminalEmulator.TERMINAL_CURSOR_STYLE_BAR) cRight = left + width / 4.f;
+            canvas.fill(new Rectangle2D.Float(left, y - cursorHeight, cRight - left, cursorHeight));
+        }
+
+        if ((effect & TextStyle.CHARACTER_ATTRIBUTE_INVISIBLE) != 0) return;
+        if ((effect & TextStyle.CHARACTER_ATTRIBUTE_DIM) != 0) foreColor = dimColor(foreColor);
+
+        Font drawFont = mEmojiFont == null ? mFont : mEmojiFont;
+        String drawText = clusterText;
+        boolean customFlag = false;
+        if (mEmojiRenderMode == 0) {
+            // Java2D's monochrome fallback must not ask a font to shape VS16 or
+            // a ZWJ sequence it cannot support: draw the first emoji component.
+            if (cluster.regionalPair) {
+                if (fontCanDisplayAll(drawFont, clusterText)) {
+                    drawText = clusterText;
+                } else {
+                    drawText = regionalIndicatorLetters(clusterText);
+                    drawFont = mFont;
+                    customFlag = true;
+                }
+            } else {
+                drawText = new String(Character.toChars(cluster.firstCodePoint));
+                if (!drawFont.canDisplay(cluster.firstCodePoint)) {
+                    // A missing ZWJ component must not turn into Java2D's
+                    // replacement-box glyph. A plain question mark is a
+                    // legible, single-cell-safe last resort.
+                    drawText = "?";
+                    drawFont = mFont;
+                }
+            }
+        }
+
+        Font styledFont = bold ? drawFont.deriveFont(Font.BOLD) : drawFont;
+        if (italic) styledFont = styledFont.deriveFont(AffineTransform.getShearInstance(-0.35, 0));
+        if (underline || strikeThrough) {
+            Map<TextAttribute, Object> attrs = new java.util.HashMap<>();
+            if (underline) attrs.put(TextAttribute.UNDERLINE, TextAttribute.UNDERLINE_ON);
+            if (strikeThrough) attrs.put(TextAttribute.STRIKETHROUGH, TextAttribute.STRIKETHROUGH_ON);
+            styledFont = styledFont.deriveFont(attrs);
+        }
+        canvas.setFont(styledFont);
+        canvas.setColor(new Color(foreColor, true));
+
+        float advance;
+        TextLayout layout = null;
+        if (mEmojiRenderMode == EMOJI_RENDER_DRAW_STRING && !customFlag) {
+            advance = (float) styledFont.getStringBounds(drawText, canvas.getFontRenderContext()).getWidth();
+            if (advance <= 0.f) advance = width;
+        } else {
+            layout = new TextLayout(drawText, styledFont, canvas.getFontRenderContext());
+            advance = layout.getAdvance();
+        }
+        float drawX = left + (width - advance) / 2.f;
+        float baseline = y - mFontLineSpacingAndAscent;
+        if (mEmojiRenderMode == EMOJI_RENDER_DRAW_STRING && !customFlag) {
+            canvas.drawString(drawText, drawX, baseline);
+        } else {
+            layout.draw(canvas, drawX, baseline);
+        }
+    }
+
+    private static boolean fontCanDisplayAll(Font font, String text) {
+        for (int codePoint : text.codePoints().toArray()) {
+            if (!font.canDisplay(codePoint)) return false;
+        }
+        return true;
+    }
+
+    private static String regionalIndicatorLetters(String text) {
+        int first = text.codePointAt(0);
+        int second = text.codePointAt(Character.charCount(first));
+        char firstLetter = (char) ('A' + first - 0x1F1E6);
+        char secondLetter = (char) ('A' + second - 0x1F1E6);
+        return new String(new char[]{firstLetter, secondLetter});
+    }
+
     private void drawTextRun(Graphics2D canvas, char[] text, int[] palette, float y, int startColumn, int runWidthColumns,
                              int startCharIndex, int runWidthChars, float mes, int cursor, int cursorStyle,
                              long textStyle, boolean reverseVideo, Font runFont) {
@@ -677,5 +1052,10 @@ public final class Java2DRenderer {
 
     public int getFontLineSpacingAndAscent() {
         return mFontLineSpacingAndAscent;
+    }
+
+    /** Exposed for headless render regressions and diagnostics. */
+    public boolean isColorEmojiEnabled() {
+        return mEmojiRenderMode != 0;
     }
 }

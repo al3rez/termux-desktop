@@ -27,6 +27,21 @@ java -Dsun.java2d.opengl=true -cp "out:lib/*" com.termux.desktop.TermuxDesktop [
 
 Ctrl+Alt+= / Ctrl+Alt+- zoom, Ctrl+Shift+V paste.
 
+## Tests
+
+Run the JUnit 5 pipeline, performance, and daemon supervision tests:
+
+```sh
+gradle --console=plain -q test --rerun-tasks
+```
+
+Run those tests together with the headless rendering regressions:
+
+```sh
+javac -cp "lib/*" -d out $(find src -name '*.java')
+test/run-tests.sh
+```
+
 ## License
 
 GPLv3, inherited from termux-app.

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Headless render regression tests. Run from the repo root:
+# Headless render, PTY pipeline, performance, and supervision regression suite.
+# Run from the repo root:
 #   javac -cp "lib/*" -d out $(find src -name '*.java')
 #   test/run-tests.sh
 set -euo pipefail
@@ -7,7 +8,10 @@ cd "$(dirname "$0")/.."
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-javac -cp out -d "$TMP" test/RenderHarness.java test/RenderChecks.java test/EmojiRenderChecks.java
+javac -cp "out:lib/*" -d "$TMP" \
+  test/RenderHarness.java \
+  test/RenderChecks.java \
+  test/EmojiRenderChecks.java
 DEJAVU=/usr/share/fonts/TTF/DejaVuSansMono.ttf
 
 # 1. Powerline separators must span the full cell height and keep segments joined.
@@ -34,4 +38,5 @@ CELL=$(java -cp "out:lib/*:$TMP" RenderHarness "$TMP/cell.png" "$DEJAVU" 20 </de
 CW=${CELL%x*}; CH=${CELL#*x}
 java -cp "out:lib/*:$TMP" RenderChecks "$TMP/pl.png" "$TMP/icons.png" "$CW" "$CH"
 java -cp "out:lib/*:$TMP" EmojiRenderChecks "$TMP/emoji.png" "$CW" "$CH" "$DEJAVU" 20
-echo "ALL RENDER TESTS PASSED"
+gradle --no-daemon --console=plain -q test --rerun-tasks
+echo "ALL TESTS PASSED"

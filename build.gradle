@@ -1,0 +1,67 @@
+plugins {
+    id 'java'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation fileTree(dir: 'lib', include: ['*.jar'])
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+sourceSets {
+    main.java.srcDirs = ['src']
+    test.java.srcDirs = ['test']
+}
+
+test {
+    useJUnitPlatform()
+    systemProperty 'java.awt.headless', 'true'
+
+    def seenClasses = new LinkedHashSet<String>()
+    def capturedOutput = new LinkedHashMap<String, StringBuilder>()
+
+    testLogging {
+        events 'failed'
+        exceptionFormat = 'full'
+        showStandardStreams = false
+    }
+
+    beforeTest { descriptor ->
+        if (seenClasses.add(descriptor.className)) {
+            println "\n${descriptor.className}"
+        }
+    }
+
+    onOutput { descriptor, event ->
+        def key = "${descriptor.className}:${descriptor.name}"
+        capturedOutput.computeIfAbsent(key) { new StringBuilder() }.append(event.message)
+    }
+
+    afterTest { descriptor, result ->
+        def icon = switch (result.resultType) {
+            case org.gradle.api.tasks.testing.TestResult.ResultType.SUCCESS -> '✓'
+            case org.gradle.api.tasks.testing.TestResult.ResultType.SKIPPED -> '○'
+            default -> '✗'
+        }
+        println "  ${icon} ${descriptor.displayName} (${result.endTime - result.startTime} ms)"
+
+        def key = "${descriptor.className}:${descriptor.name}"
+        capturedOutput.remove(key)?.toString()?.readLines()?.findAll { !it.isBlank() }?.each {
+            println "      # ${it}"
+        }
+    }
+
+    afterSuite { descriptor, result ->
+        if (descriptor.parent == null) {
+            def elapsed = String.format('%.3f', (result.endTime - result.startTime) / 1000.0)
+            println "\nFinished in ${elapsed} seconds"
+            println "${result.testCount} examples, ${result.failedTestCount} failures, ${result.skippedTestCount} pending"
+        }
+    }
+}

@@ -28,7 +28,6 @@ public final class Java2DRenderer {
     final int mTextSize;
     final Font mFont;
     final Font mFontBold;
-    final Font mFontItalic;
 
     final float mFontWidth;
     final int mFontLineSpacing;
@@ -57,7 +56,6 @@ public final class Java2DRenderer {
         mTextSize = textSize;
         mFont = font.deriveFont((float) textSize);
         mFontBold = mFont.deriveFont(Font.BOLD);
-        mFontItalic = mFont.deriveFont(AffineTransform.getShearInstance(-0.35, 0));
 
         BufferedImage img = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g = img.createGraphics();
@@ -854,7 +852,6 @@ public final class Java2DRenderer {
         int backColor = TextStyle.decodeBackColor(textStyle);
         final boolean bold = (effect & (TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_BLINK)) != 0;
         final boolean underline = (effect & TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE) != 0;
-        final boolean italic = (effect & TextStyle.CHARACTER_ATTRIBUTE_ITALIC) != 0;
         final boolean strikeThrough = (effect & TextStyle.CHARACTER_ATTRIBUTE_STRIKETHROUGH) != 0;
 
         if ((foreColor & 0xff000000) != 0xff000000) {
@@ -917,7 +914,6 @@ public final class Java2DRenderer {
         }
 
         Font styledFont = bold ? drawFont.deriveFont(Font.BOLD) : drawFont;
-        if (italic) styledFont = styledFont.deriveFont(AffineTransform.getShearInstance(-0.35, 0));
         if (underline || strikeThrough) {
             Map<TextAttribute, Object> attrs = new java.util.HashMap<>();
             if (underline) attrs.put(TextAttribute.UNDERLINE, TextAttribute.UNDERLINE_ON);
@@ -968,7 +964,6 @@ public final class Java2DRenderer {
         int backColor = TextStyle.decodeBackColor(textStyle);
         final boolean bold = (effect & (TextStyle.CHARACTER_ATTRIBUTE_BOLD | TextStyle.CHARACTER_ATTRIBUTE_BLINK)) != 0;
         final boolean underline = (effect & TextStyle.CHARACTER_ATTRIBUTE_UNDERLINE) != 0;
-        final boolean italic = (effect & TextStyle.CHARACTER_ATTRIBUTE_ITALIC) != 0;
         final boolean strikeThrough = (effect & TextStyle.CHARACTER_ATTRIBUTE_STRIKETHROUGH) != 0;
         final boolean dim = (effect & TextStyle.CHARACTER_ATTRIBUTE_DIM) != 0;
 
@@ -1026,7 +1021,6 @@ public final class Java2DRenderer {
             }
 
             Font f = bold ? runFont.deriveFont(Font.BOLD) : runFont;
-            if (italic) f = f.deriveFont(AffineTransform.getShearInstance(-0.35, 0));
             if (underline || strikeThrough) {
                 Map<TextAttribute, Object> attrs = new java.util.HashMap<>();
                 if (underline) attrs.put(TextAttribute.UNDERLINE, TextAttribute.UNDERLINE_ON);

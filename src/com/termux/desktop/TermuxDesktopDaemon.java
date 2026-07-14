@@ -30,6 +30,7 @@ public final class TermuxDesktopDaemon {
             new TermuxDesktopDaemon().run();
         } catch (Throwable t) {
             logFailure("daemon", t);
+            System.exit(1);
         }
     }
 

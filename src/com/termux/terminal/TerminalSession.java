@@ -8,10 +8,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -25,28 +23,33 @@ import javax.swing.SwingUtilities;
 public final class TerminalSession extends TerminalOutput {
 
     /*
-     * The reader owns the pty and these batches.  The emulator is owned by the
-     * EDT; the queue is the only intentional hand-off between the two.
+     * The reader owns the pty.  The emulator is owned by the EDT; this bounded
+     * byte buffer is the only intentional hand-off between the two.
      *
-     * Keep one batch in the reader in addition to the queue slots, so the
-     * maximum retained pty output is approximately 256 KiB.  ArrayBlockingQueue
-     * also gives us backpressure instead of allowing invokeLater/event-queue
-     * work to grow without bound.
-     */
+     * A byte buffer, rather than a queue of individual reads, lets the small
+     * reads returned by Unix pty4j coalesce while retaining a real 256 KiB
+     * backpressure budget.  PTYInputStream.available() cannot be used for this:
+     * pty4j 0.13.4 reports zero on Unix even when more data can be read.
+    */
     private static final int PTY_READ_BYTES = 4 * 1024;
-    private static final int PTY_BATCH_BYTES = 32 * 1024;
     private static final int PTY_BUFFER_BYTES = 256 * 1024;
-    private static final int OUTPUT_QUEUE_CAPACITY = PTY_BUFFER_BYTES / PTY_BATCH_BYTES - 1;
+    private static final int EDT_APPEND_BYTES = 1024;
     private static final int EDT_DRAIN_BYTES = 64 * 1024;
+    private static final long EDT_DRAIN_NANOS = 4_000_000L;
 
     /** Emulator state is read and mutated on the Swing EDT only. */
     public TerminalEmulator mEmulator;
     private final TerminalSessionClient mClient;
-    private final ArrayBlockingQueue<OutputBatch> mOutputQueue =
-        new ArrayBlockingQueue<>(OUTPUT_QUEUE_CAPACITY);
+    private final Object mOutputLock = new Object();
+    private final byte[] mOutputBuffer = new byte[PTY_BUFFER_BYTES];
+    /** A small append slice makes the EDT time limit effective for costly escapes. */
+    private final byte[] mEdtBatch = new byte[EDT_APPEND_BYTES];
     private final AtomicBoolean mDrainScheduled = new AtomicBoolean();
     private final AtomicBoolean mPtyEndQueued = new AtomicBoolean();
     private final AtomicLong mAppendedBytes = new AtomicLong();
+    private int mOutputReadPosition;
+    private int mOutputWritePosition;
+    private int mOutputSize;
     private PtyProcess mProcess;
     private OutputStream mPtyIn;
     private volatile boolean mFinished;
@@ -79,46 +82,23 @@ public final class TerminalSession extends TerminalOutput {
     }
 
     /**
-     * Read and batch pty output without waiting for the EDT.  Only EOF or an
-     * IOException from the pty ends the session; unexpected runtime failures
-     * are logged and the reader keeps trying.
+     * Read pty output without waiting for the EDT.  The bounded hand-off buffer
+     * blocks this thread when the EDT falls behind.  EOF, I/O errors, and
+     * unexpected stream failures all end only this terminal session.
      */
     private void readPty(PtyProcess process) {
         InputStream in = null;
         byte[] readBuffer = new byte[PTY_READ_BYTES];
-        BatchBuffer batch = new BatchBuffer();
         try {
             while (!mFinished) {
                 try {
                     if (in == null) in = process.getInputStream();
                     int n = readFromPty(in, readBuffer, readBuffer.length);
                     if (n == -1) {
-                        if (!flushBatch(batch)) return;
                         queuePtyEnd();
                         return;
                     }
-                    if (n > 0) batch.length = appendToBatch(readBuffer, n, batch.data, batch.length);
-
-                    boolean eof = false;
-                    while (!mFinished) {
-                        if (batch.length == batch.data.length && !flushBatch(batch)) return;
-                        if (availableOnPty(in) <= 0) break;
-
-                        int readLimit = Math.min(readBuffer.length, batch.data.length - batch.length);
-                        n = readFromPty(in, readBuffer, readLimit);
-                        if (n == -1) {
-                            eof = true;
-                            break;
-                        }
-                        if (n == 0) break;
-                        batch.length = appendToBatch(readBuffer, n, batch.data, batch.length);
-                    }
-
-                    if (!flushBatch(batch)) return;
-                    if (eof) {
-                        queuePtyEnd();
-                        return;
-                    }
+                    if (n > 0 && !enqueueData(readBuffer, n)) return;
                 } catch (IOException e) {
                     if (!mFinished) {
                         logFailure("pty read", e);
@@ -126,11 +106,11 @@ public final class TerminalSession extends TerminalOutput {
                     }
                     return;
                 } catch (Throwable t) {
-                    logFailure("pty reader", t);
-                    // Keep this supervisor loop alive for an unexpected client
-                    // or stream implementation failure.  A pty IOException
-                    // takes the explicit terminal path above.
-                    Thread.yield();
+                    if (!mFinished) {
+                        logFailure("pty reader", t);
+                        queuePtyEnd();
+                    }
+                    return;
                 }
             }
         } finally {
@@ -144,98 +124,41 @@ public final class TerminalSession extends TerminalOutput {
         }
     }
 
-    private int appendToBatch(byte[] source, int length, byte[] batch, int batchLength) {
-        int copied = Math.min(length, batch.length - batchLength);
-        System.arraycopy(source, 0, batch, batchLength, copied);
-        if (copied != length) throw new IllegalStateException("pty read exceeded batch capacity");
-        return batchLength + copied;
-    }
-
     private int readFromPty(InputStream in, byte[] buffer, int length) throws IOException {
         if (length <= 0) return 0;
-        while (!mFinished) {
-            try {
-                return in.read(buffer, 0, length);
-            } catch (IOException e) {
-                throw e;
-            } catch (Throwable t) {
-                logFailure("pty read attempt", t);
-                Thread.yield();
-            }
-        }
-        return -1;
+        return in.read(buffer, 0, length);
     }
 
-    private int availableOnPty(InputStream in) throws IOException {
-        try {
-            return Math.max(0, in.available());
-        } catch (IOException e) {
-            throw e;
-        } catch (Throwable t) {
-            logFailure("pty availability check", t);
-            return 0;
-        }
-    }
-
-    /** Blocks when the bounded output queue is full, providing pty backpressure. */
+    /** Copies into the circular buffer, blocking here to provide pty backpressure. */
     private boolean enqueueData(byte[] data, int length) {
-        byte[] queuedData = length == data.length ? data : Arrays.copyOf(data, length);
-        OutputBatch batch = new OutputBatch(queuedData, length, false);
-        while (!mFinished) {
-            try {
-                mOutputQueue.put(batch);
-            } catch (InterruptedException e) {
+        int offset = 0;
+        while (offset < length && !mFinished) {
+            synchronized (mOutputLock) {
+                while (mOutputSize == mOutputBuffer.length && !mFinished) {
+                    try {
+                        mOutputLock.wait();
+                    } catch (InterruptedException e) {
+                        if (mFinished) return false;
+                        logFailure("pty buffer interrupted", e);
+                    }
+                }
                 if (mFinished) return false;
-                logFailure("pty queue interrupted", e);
-                continue;
-            } catch (Throwable t) {
-                logFailure("pty queue", t);
-                Thread.yield();
-                continue;
-            }
-            try {
-                scheduleDrain();
-            } catch (Throwable t) {
-                // The batch is already in the bounded queue; leave it there
-                // and let a later enqueue or end marker retry scheduling.
-                logFailure("EDT output scheduling", t);
-            }
-            return true;
-        }
-        return false;
-    }
 
-    private boolean flushBatch(BatchBuffer batch) {
-        if (batch.length == 0) return true;
-        boolean full = batch.length == batch.data.length;
-        if (!enqueueData(batch.data, batch.length)) return false;
-        if (full) batch.data = new byte[PTY_BATCH_BYTES];
-        batch.length = 0;
-        return true;
+                int copied = Math.min(length - offset, mOutputBuffer.length - mOutputSize);
+                copied = Math.min(copied, mOutputBuffer.length - mOutputWritePosition);
+                System.arraycopy(data, offset, mOutputBuffer, mOutputWritePosition, copied);
+                mOutputWritePosition = (mOutputWritePosition + copied) % mOutputBuffer.length;
+                mOutputSize += copied;
+                offset += copied;
+            }
+            scheduleDrain();
+        }
+        return offset == length;
     }
 
     private void queuePtyEnd() {
         if (mFinished || !mPtyEndQueued.compareAndSet(false, true)) return;
-        OutputBatch end = new OutputBatch(null, 0, true);
-        while (!mFinished) {
-            try {
-                mOutputQueue.put(end);
-            } catch (InterruptedException e) {
-                if (mFinished) return;
-                logFailure("pty end queue interrupted", e);
-                continue;
-            } catch (Throwable t) {
-                logFailure("pty end queue", t);
-                Thread.yield();
-                continue;
-            }
-            try {
-                scheduleDrain();
-            } catch (Throwable t) {
-                logFailure("EDT output scheduling", t);
-            }
-            return;
-        }
+        scheduleDrain();
     }
 
     /** Post at most one drain runnable, so the AWT event queue stays bounded too. */
@@ -251,37 +174,61 @@ public final class TerminalSession extends TerminalOutput {
 
     /** All emulator mutation and client notifications happen here, on the EDT. */
     private void drainOutputOnEdt() {
+        long startedAt = System.nanoTime();
         int drainedBytes = 0;
         boolean changed = false;
         try {
-            while (!mFinished && drainedBytes < EDT_DRAIN_BYTES) {
-                OutputBatch batch = mOutputQueue.poll();
-                if (batch == null) break;
-                if (batch.end) {
+            while (!mFinished
+                && drainedBytes < EDT_DRAIN_BYTES
+                && (drainedBytes == 0 || System.nanoTime() - startedAt < EDT_DRAIN_NANOS)) {
+                int length;
+                boolean end;
+                synchronized (mOutputLock) {
+                    length = Math.min(mOutputSize, mEdtBatch.length);
+                    end = length == 0 && mPtyEndQueued.get();
+                    if (length > 0) {
+                        int first = Math.min(length, mOutputBuffer.length - mOutputReadPosition);
+                        System.arraycopy(mOutputBuffer, mOutputReadPosition, mEdtBatch, 0, first);
+                        if (first < length) {
+                            System.arraycopy(mOutputBuffer, 0, mEdtBatch, first, length - first);
+                        }
+                        mOutputReadPosition = (mOutputReadPosition + length) % mOutputBuffer.length;
+                        mOutputSize -= length;
+                        mOutputLock.notifyAll();
+                    }
+                }
+                if (end) {
                     notifyTextChanged(changed);
                     notifySessionFinished();
                     return;
                 }
+                if (length == 0) break;
+                drainedBytes += length;
 
                 TerminalEmulator emulator = mEmulator;
                 if (emulator == null) continue;
                 try {
-                    emulator.append(batch.data, batch.length);
-                    mAppendedBytes.addAndGet(batch.length);
+                    emulator.append(mEdtBatch, length);
+                    mAppendedBytes.addAndGet(length);
                     changed = true;
                 } catch (Throwable t) {
                     // A malformed escape sequence or emulator regression must
                     // lose one batch, not the EDT or every other window.
                     logFailure("emulator append", t);
                 }
-                drainedBytes += batch.length;
             }
             notifyTextChanged(changed);
         } catch (Throwable t) {
             logFailure("EDT output drain", t);
         } finally {
             mDrainScheduled.set(false);
-            if (!mFinished && !mOutputQueue.isEmpty()) scheduleDrain();
+            if (!mFinished && hasPendingOutput()) scheduleDrain();
+        }
+    }
+
+    private boolean hasPendingOutput() {
+        synchronized (mOutputLock) {
+            return mOutputSize > 0 || mPtyEndQueued.get();
         }
     }
 
@@ -336,7 +283,12 @@ public final class TerminalSession extends TerminalOutput {
     public synchronized void finish() {
         if (mFinished) return;
         mFinished = true;
-        mOutputQueue.clear();
+        synchronized (mOutputLock) {
+            mOutputSize = 0;
+            mOutputReadPosition = 0;
+            mOutputWritePosition = 0;
+            mOutputLock.notifyAll();
+        }
         if (mProcess != null) {
             try {
                 mProcess.destroy();
@@ -414,20 +366,4 @@ public final class TerminalSession extends TerminalOutput {
         }
     }
 
-    private static final class OutputBatch {
-        final byte[] data;
-        final int length;
-        final boolean end;
-
-        OutputBatch(byte[] data, int length, boolean end) {
-            this.data = data;
-            this.length = length;
-            this.end = end;
-        }
-    }
-
-    private static final class BatchBuffer {
-        byte[] data = new byte[PTY_BATCH_BYTES];
-        int length;
-    }
 }
